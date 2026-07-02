@@ -156,9 +156,6 @@ def ask_string(title, prompt, default=""):
     field = JTextArea(default, 4, 24)
     field.setLineWrap(True)
     field.setWrapStyleWord(True)
-    enter = KeyStroke.getKeyStroke(KeyEvent.VK_ENTER,
-                                   awt.event.InputEvent.SHIFT_DOWN_MASK)
-    field.getInputMap().put(enter, "insert-break")
     panel.add(JScrollPane(field))
     btn_row = JPanel()
     btn_row.setLayout(BoxLayout(btn_row, BoxLayout.X_AXIS))
@@ -195,9 +192,26 @@ def ask_string(title, prompt, default=""):
     panel.add(Box.createVerticalStrut(4))
     panel.add(btn_row)
 
-    result = JOptionPane.showConfirmDialog(None, panel, title,
-                                           JOptionPane.OK_CANCEL_OPTION,
-                                           JOptionPane.PLAIN_MESSAGE)
+    pane = JOptionPane(panel, JOptionPane.PLAIN_MESSAGE,
+                       JOptionPane.OK_CANCEL_OPTION)
+    dialog = pane.createDialog(None, title)
+
+    enter = KeyStroke.getKeyStroke(KeyEvent.VK_ENTER, 0)
+    shift_enter = KeyStroke.getKeyStroke(KeyEvent.VK_ENTER,
+                                         awt.event.InputEvent.SHIFT_DOWN_MASK)
+
+    class _AcceptAction(AbstractAction):
+        def actionPerformed(self, event):
+            pane.setValue(JOptionPane.OK_OPTION)
+            dialog.dispose()
+
+    field.getInputMap().put(enter, "accept-dialog")
+    field.getActionMap().put("accept-dialog", _AcceptAction())
+    field.getInputMap().put(shift_enter, "insert-break")
+
+    field.requestFocusInWindow()
+    dialog.setVisible(True)
+    result = pane.getValue()
     if result != JOptionPane.OK_OPTION:
         return None
     return field.getText().strip()
@@ -219,6 +233,9 @@ def ask_int(title, prompt, default=300):
     if gd.wasCanceled():
         return None
     return int(gd.getNextNumber())
+
+def kda_label_text(value):
+    return str(value).strip()
 
 def crop_imp(imp, x, y, w, h):
     imp.setRoi(x, y, w, h)
@@ -432,7 +449,7 @@ class FigureRenderer(object):
                 g.setColor(Color.BLACK)
                 g.setStroke(BasicStroke(1.2))
                 g.drawLine(x0, ty, x1, ty)
-                lbl = "%g" % m["kda"]
+                lbl = kda_label_text(m["kda"])
                 lw  = fm.stringWidth(lbl)
                 if is_sel:
                     g.setColor(Color(0, 100, 220))
@@ -1184,13 +1201,16 @@ class WBTool(ActionListener):
         IJ.setTool("rectangle")
 
     def _on_gel_click(self, scene_y):
-        gd = GenericDialog("kDa value")
-        gd.addNumericField("Enter kDa for this band:", 0.0, 1)
-        gd.setAlwaysOnTop(True);  gd.toFront();  gd.requestFocus()
-        gd.showDialog()
-        if gd.wasCanceled(): return
-        val = gd.getNextNumber()
-        self.kda_markers.append({"y_orig": scene_y, "kda": float(val),
+        val = ask_string("kDa value", "Enter kDa label for this band:", "0")
+        if val is None:
+            return
+        val = val.strip()
+        if not val:
+            JOptionPane.showMessageDialog(self.frame,
+                "Please enter a kDa label.", "Invalid kDa",
+                JOptionPane.WARNING_MESSAGE)
+            return
+        self.kda_markers.append({"y_orig": scene_y, "kda": val,
                                  "font_size": self.default_font_sizes["kda"]})
         self.kda_markers.sort(key=lambda d: d["y_orig"])
         self._redraw_kda_overlay()
@@ -1205,7 +1225,7 @@ class WBTool(ActionListener):
             tick = Line(x0, y, x1, y)
             tick.setStrokeColor(Color.RED);  tick.setStrokeWidth(1.5)
             ov.add(tick)
-            lbl = TextRoi(x0 - 35, y - 7, "%g" % m["kda"], FONT_KDA)
+            lbl = TextRoi(x0 - 35, y - 7, kda_label_text(m["kda"]), FONT_KDA)
             lbl.setStrokeColor(Color.RED);  ov.add(lbl)
         self.gel_imp.setOverlay(ov);  self.gel_imp.updateAndDraw()
 
@@ -1622,7 +1642,7 @@ class WBTool(ActionListener):
         ty = iy + m["y_orig"] * sc
         x1 = ix - 2
         x0 = x1 - TICK_LEN
-        lbl = "%g" % m["kda"]
+        lbl = kda_label_text(m["kda"])
         text_w = HIT_RADIUS * 4
         text_h = FONT_KDA.getSize()
         if self.fig_canvas.bi is not None:
@@ -1829,7 +1849,7 @@ class WBTool(ActionListener):
         elif isinstance(best, tuple) and best[0] == "ba":
             self._set_status("Selected: band tick \"%s\"  |  drag up/down, dbl-click to rename" % plain_text(best[2]["text"]))
         elif isinstance(best, tuple) and best[0] == "kda":
-            self._set_status("Selected: kDa label \"%g\"  |  A-/A+ to resize" % best[2]["kda"])
+            self._set_status("Selected: kDa label \"%s\"  |  A-/A+ to resize" % kda_label_text(best[2]["kda"]))
         elif isinstance(best, tuple) and best[0] == "protein":
             self._set_status("Selected: protein name \"%s\"  |  drag/nudge, A-/A+ to resize" % plain_text(best[1].protein_name))
         self._refresh_figure()
@@ -2296,7 +2316,7 @@ class WBTool(ActionListener):
                 ty = iy + m["y_orig"] * sc
                 x1p = ix - 2;  x0p = x1p - TICK_LEN
                 pdf_line(pt(x0p), fy(ty), pt(x1p), fy(ty), w=1.2)
-                lbl = "%g" % m["kda"]
+                lbl = kda_label_text(m["kda"])
                 fs = font_pt(FONT_KDA, m.get("font_size", FONT_KDA.getSize()))
                 lw  = bf.getWidthPoint(lbl, fs)
                 pdf_text(lbl, fs, pt(x0p) - TICK_GAP*spt - lw,
