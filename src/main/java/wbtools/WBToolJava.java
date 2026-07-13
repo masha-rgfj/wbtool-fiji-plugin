@@ -6,11 +6,13 @@ import com.itextpdf.text.pdf.PdfWriter;
 import ij.IJ;
 import ij.ImagePlus;
 import ij.Prefs;
+import ij.WindowManager;
 import ij.gui.ImageCanvas;
 import ij.gui.Line;
 import ij.gui.Overlay;
 import ij.gui.Roi;
 import ij.gui.TextRoi;
+import ij.gui.Toolbar;
 import ij.process.ImageConverter;
 import java.awt.BasicStroke;
 import java.awt.BorderLayout;
@@ -29,7 +31,6 @@ import java.awt.event.ActionListener;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.event.MouseListener;
-import java.awt.event.MouseMotionListener;
 import java.awt.geom.AffineTransform;
 import java.awt.image.BufferedImage;
 import java.io.File;
@@ -54,7 +55,7 @@ import javax.swing.filechooser.FileNameExtensionFilter;
 import org.scijava.command.Command;
 import org.scijava.plugin.Plugin;
 
-@Plugin(type = Command.class, menuPath = "Plugins>WB Tools>WB Tool Java 0.1.0-alpha")
+@Plugin(type = Command.class, menuPath = "Plugins>WB Tools>WB Tool Java 0.2.0-alpha")
 public class WBToolJava implements Command {
     @Override
     public void run() {
@@ -93,6 +94,7 @@ public class WBToolJava implements Command {
         private FigureCanvas figureCanvas;
 
         private ImagePlus gelImp;
+        private ImagePlus markerImp;
         private File lastDir;
         private final List<KdaMarker> kdaMarkers = new ArrayList<KdaMarker>();
         private final List<BandCrop> bands = new ArrayList<BandCrop>();
@@ -102,8 +104,7 @@ public class WBToolJava implements Command {
         private boolean waitingForCrop;
         private boolean cropWasMarking;
         private MouseListener gelMouseListener;
-        private MouseListener[] savedMouseListeners = new MouseListener[0];
-        private MouseMotionListener[] savedMouseMotionListeners = new MouseMotionListener[0];
+        private ImageCanvas kdaCanvas;
         private BandCrop selectedBand;
 
         public void showFrame() {
@@ -125,10 +126,11 @@ public class WBToolJava implements Command {
             tools.setPreferredSize(new Dimension(TOOL_BUTTON_W + 20, 10));
 
             addSection(tools, "Image");
-            tools.add(button("Open Image...", "open_image"));
+            tools.add(button("Open Gel Image...", "open_image"));
             tools.add(Box.createVerticalStrut(8));
 
             addSection(tools, "kDa Markers");
+            tools.add(button("Open kDa Marker Image...", "open_marker_image"));
             markButton = button("Mark kDa Bands", "toggle_mark_kda");
             tools.add(markButton);
             sourceKdaLabelsButton = button("Hide kDa Labels", "toggle_source_kda_labels");
@@ -196,6 +198,8 @@ public class WBToolJava implements Command {
             String command = event.getActionCommand();
             if ("open_image".equals(command)) {
                 openImage();
+            } else if ("open_marker_image".equals(command)) {
+                openMarkerImage();
             } else if ("toggle_mark_kda".equals(command)) {
                 toggleMarkKda();
             } else if ("toggle_source_kda_labels".equals(command)) {
@@ -226,11 +230,36 @@ public class WBToolJava implements Command {
             if (kdaModeActive) {
                 deactivateKdaMode();
             }
+            if (markerImp == null) {
+                clearOverlay(gelImp);
+            }
             gelImp = imp;
+            if (markerImp == null) {
+                kdaMarkers.clear();
+            }
+            showImageRightHalf(imp);
+            activateGelImage();
+            setCropSelectionTool();
+            setStatus(markerImp == null
+                    ? "Gel loaded. Mark kDa bands on it, or open a separate kDa marker image."
+                    : "Gel loaded. Existing markers from the kDa marker image will be applied to crops.");
+        }
+
+        private void openMarkerImage() {
+            ImagePlus imp = openRgbImage();
+            if (imp == null) {
+                return;
+            }
+            cancelCropMode();
+            if (kdaModeActive) {
+                deactivateKdaMode();
+            }
+            clearOverlay(kdaSourceImage());
+            markerImp = imp;
             kdaMarkers.clear();
             showImageRightHalf(imp);
-            IJ.setTool("rectangle");
-            setStatus("Image loaded. Mark kDa bands or draw a crop.");
+            setCropSelectionTool();
+            setStatus("kDa marker image loaded. Click Mark kDa Bands, then click its marker bands.");
         }
 
         private void cancelCropMode() {
@@ -284,8 +313,8 @@ public class WBToolJava implements Command {
         }
 
         private void toggleMarkKda() {
-            if (gelImp == null) {
-                JOptionPane.showMessageDialog(frame, "Open a gel image first.",
+            if (kdaSourceImage() == null) {
+                JOptionPane.showMessageDialog(frame, "Open a gel image or a kDa marker image first.",
                         "No image", JOptionPane.WARNING_MESSAGE);
                 return;
             }
@@ -297,25 +326,19 @@ public class WBToolJava implements Command {
         }
 
         private void activateKdaMode() {
-            if (gelImp == null || gelImp.getCanvas() == null) {
+            final ImagePlus source = kdaSourceImage();
+            if (source == null || source.getCanvas() == null) {
                 return;
             }
             kdaModeActive = true;
             markButton.setText("Stop Marking kDa");
             markButton.setBackground(new Color(255, 180, 0));
-            setStatus("kDa marking active. Click a marker band in the source image.");
+            setStatus(markerImp == null
+                    ? "kDa marking active. Click a marker band in the gel image."
+                    : "kDa marking active. Click a marker band in the separate marker image.");
             IJ.setTool("point");
 
-            final ImageCanvas canvas = gelImp.getCanvas();
-            savedMouseListeners = canvas.getMouseListeners();
-            for (MouseListener listener : savedMouseListeners) {
-                canvas.removeMouseListener(listener);
-            }
-            savedMouseMotionListeners = canvas.getMouseMotionListeners();
-            for (MouseMotionListener listener : savedMouseMotionListeners) {
-                canvas.removeMouseMotionListener(listener);
-            }
-
+            final ImageCanvas canvas = source.getCanvas();
             gelMouseListener = new MouseAdapter() {
                 @Override
                 public void mousePressed(MouseEvent event) {
@@ -328,6 +351,7 @@ public class WBToolJava implements Command {
                     onGelClick(x, y);
                 }
             };
+            kdaCanvas = canvas;
             canvas.addMouseListener(gelMouseListener);
         }
 
@@ -335,22 +359,12 @@ public class WBToolJava implements Command {
             kdaModeActive = false;
             markButton.setText("Mark kDa Bands");
             markButton.setBackground(null);
-            if (gelImp != null && gelImp.getCanvas() != null) {
-                ImageCanvas canvas = gelImp.getCanvas();
-                if (gelMouseListener != null) {
-                    canvas.removeMouseListener(gelMouseListener);
-                }
-                for (MouseListener listener : savedMouseListeners) {
-                    canvas.addMouseListener(listener);
-                }
-                for (MouseMotionListener listener : savedMouseMotionListeners) {
-                    canvas.addMouseMotionListener(listener);
-                }
+            if (kdaCanvas != null && gelMouseListener != null) {
+                kdaCanvas.removeMouseListener(gelMouseListener);
             }
             gelMouseListener = null;
-            savedMouseListeners = new MouseListener[0];
-            savedMouseMotionListeners = new MouseMotionListener[0];
-            IJ.setTool("rectangle");
+            kdaCanvas = null;
+            setCropSelectionTool();
             setStatus(" ");
         }
 
@@ -387,12 +401,12 @@ public class WBToolJava implements Command {
         }
 
         private void redrawKdaOverlay() {
-            if (gelImp == null) {
+            ImagePlus source = kdaSourceImage();
+            if (source == null) {
                 return;
             }
             if (kdaMarkers.isEmpty()) {
-                gelImp.setOverlay(null);
-                gelImp.updateAndDraw();
+                clearOverlay(source);
                 return;
             }
             Overlay overlay = new Overlay();
@@ -416,8 +430,19 @@ public class WBToolJava implements Command {
                     overlay.add(label);
                 }
             }
-            gelImp.setOverlay(overlay);
-            gelImp.updateAndDraw();
+            source.setOverlay(overlay);
+            source.updateAndDraw();
+        }
+
+        private ImagePlus kdaSourceImage() {
+            return markerImp != null ? markerImp : gelImp;
+        }
+
+        private void clearOverlay(ImagePlus imp) {
+            if (imp != null) {
+                imp.setOverlay(null);
+                imp.updateAndDraw();
+            }
         }
 
         private void undoLastKda() {
@@ -442,22 +467,35 @@ public class WBToolJava implements Command {
                 return;
             }
             if (!waitingForCrop) {
-                waitingForCrop = true;
                 cropWasMarking = kdaModeActive;
                 if (kdaModeActive) {
                     deactivateKdaMode();
                 }
-                setCropSelectionTool();
-                cropButton.setText("Confirm Crop");
-                cropButton.setBackground(new Color(255, 180, 0));
-                setStatus("Draw a crop on the source image. You can rotate it, then click Confirm Crop.");
-                return;
+                activateGelImage();
+                if (!setCropSelectionTool()) {
+                    cropButton.setText("Crop Region -> Figure");
+                    cropButton.setBackground(null);
+                    JOptionPane.showMessageDialog(frame,
+                            "Fiji could not activate the Rotated Rectangle tool. "
+                                    + "Please restart Fiji and try again.",
+                            "Crop tool unavailable", JOptionPane.ERROR_MESSAGE);
+                    restoreCropMarkMode();
+                    return;
+                }
+                if (gelImp.getRoi() == null) {
+                    waitingForCrop = true;
+                    cropButton.setText("Confirm Crop");
+                    cropButton.setBackground(new Color(255, 180, 0));
+                    setStatus("Draw and rotate the crop rectangle, then click Confirm Crop.");
+                    return;
+                }
             }
 
             Roi roi = gelImp.getRoi();
             if (roi == null) {
                 JOptionPane.showMessageDialog(frame, "No selection found. Click Crop again and draw first.",
                         "No selection", JOptionPane.WARNING_MESSAGE);
+                activateGelImage();
                 setCropSelectionTool();
                 setStatus("Crop mode is still active. Draw a crop on the source image, then click Confirm Crop.");
                 return;
@@ -467,6 +505,8 @@ public class WBToolJava implements Command {
             if (crop == null) {
                 JOptionPane.showMessageDialog(frame, "Selection is too small. Please try again.",
                         "Crop", JOptionPane.WARNING_MESSAGE);
+                gelImp.killRoi();
+                activateGelImage();
                 setCropSelectionTool();
                 setStatus("Crop mode is still active. Draw a larger crop, then click Confirm Crop.");
                 return;
@@ -477,9 +517,12 @@ public class WBToolJava implements Command {
 
             List<CropMarker> localMarkers = new ArrayList<CropMarker>();
             for (KdaMarker marker : kdaMarkers) {
-                double yInCrop = markerYInCrop(marker, crop.x, crop.y, crop.angleDeg);
+                Point2D markerOnGel = markerInGelCoordinates(marker);
+                double yInCrop = markerYInCrop(
+                        markerOnGel.x, markerOnGel.y, crop.x, crop.y, crop.angleDeg);
                 if (yInCrop >= -0.5 && yInCrop <= crop.height + 0.5) {
-                    localMarkers.add(new CropMarker(marker.label, yInCrop, marker.xAbs, marker.yAbs));
+                    localMarkers.add(new CropMarker(
+                            marker.label, yInCrop, markerOnGel.x, markerOnGel.y));
                 }
             }
             Collections.sort(localMarkers, new Comparator<CropMarker>() {
@@ -509,6 +552,9 @@ public class WBToolJava implements Command {
             bands.add(band);
             selectedBand = band;
             figureCanvas.refreshLayout();
+            gelImp.killRoi();
+            activateGelImage();
+            setCropSelectionTool();
             setStatus("Crop added. kDa ticks are tied to the crop and scale with it.");
             restoreCropMarkMode();
         }
@@ -530,14 +576,28 @@ public class WBToolJava implements Command {
             return Math.max(80, Math.min(imageWidth, available));
         }
 
-        private void setCropSelectionTool() {
+        private void activateGelImage() {
+            if (gelImp == null) {
+                return;
+            }
+            if (gelImp.getWindow() != null) {
+                WindowManager.setCurrentWindow(gelImp.getWindow());
+                gelImp.getWindow().toFront();
+            }
+            if (gelImp.getCanvas() != null) {
+                gelImp.getCanvas().requestFocusInWindow();
+            }
+        }
+
+        private boolean setCropSelectionTool() {
             Roi.setColor(CROP_COLOR);
             trySetDefaultRoiStrokeWidth(CROP_STROKE_WIDTH);
-            try {
-                IJ.setTool("rotated rectangle");
-            } catch (RuntimeException ex) {
-                IJ.setTool("rectangle");
+            Toolbar toolbar = Toolbar.getInstance();
+            if (toolbar == null || !toolbar.setTool("rotated rectangle")) {
+                return false;
             }
+            return Toolbar.getToolId() == Toolbar.RECTANGLE
+                    && Toolbar.getRectToolType() == Toolbar.ROTATED_RECT_ROI;
         }
 
         private void trySetDefaultRoiStrokeWidth(float width) {
@@ -618,11 +678,21 @@ public class WBToolJava implements Command {
             return new CropResult(cropped, x, y, width, height, Math.toDegrees(angle));
         }
 
-        private static double markerYInCrop(KdaMarker marker, double cropX, double cropY,
+        private Point2D markerInGelCoordinates(KdaMarker marker) {
+            if (gelImp == null || markerImp == null || markerImp == gelImp) {
+                return new Point2D(marker.xAbs, marker.yAbs);
+            }
+            double scaleX = gelImp.getWidth() / (double) markerImp.getWidth();
+            double scaleY = gelImp.getHeight() / (double) markerImp.getHeight();
+            return new Point2D(marker.xAbs * scaleX, marker.yAbs * scaleY);
+        }
+
+        private static double markerYInCrop(double markerX, double markerY,
+                double cropX, double cropY,
                 double cropAngleDeg) {
             double angle = Math.toRadians(cropAngleDeg);
-            double dx = marker.xAbs - cropX;
-            double dy = marker.yAbs - cropY;
+            double dx = markerX - cropX;
+            double dy = markerY - cropY;
             return -Math.sin(angle) * dx + Math.cos(angle) * dy;
         }
 
@@ -859,7 +929,8 @@ public class WBToolJava implements Command {
             int baseY = Controller.TOP_MARGIN;
             for (BandCrop band : controller.bands()) {
                 Rectangle rect = layoutRectFor(band, baseY);
-                drawBand(g, band, rect, band == controller.selectedBand());
+                boolean showSelection = paintBackground && band == controller.selectedBand();
+                drawBand(g, band, rect, showSelection);
                 baseY += rect.height + Controller.BAND_GAP + 20;
             }
         }
@@ -906,6 +977,16 @@ public class WBToolJava implements Command {
             this.xAbs = xAbs;
             this.yAbs = yAbs;
             this.label = label;
+        }
+    }
+
+    private static final class Point2D {
+        final double x;
+        final double y;
+
+        Point2D(double x, double y) {
+            this.x = x;
+            this.y = y;
         }
     }
 
