@@ -1,3 +1,16 @@
+# gelanno_fiji.py
+# Drop into:  Fiji.app/plugins/WBTool.py
+# Run via:    Plugins > gelanno
+#
+# Requires:   Fiji (https://fiji.sc) — no extra dependencies
+# Works with ImageJ if itextpdf module is installed (in jars folder)
+# Formats:    TIFF, PNG, JPEG
+#
+# If you use Gelanno in published research, please cite:
+# Maria A. Pirozhkova (Masha) (RGFJ), Elisheva Babitz
+# *Gelanno: A GUI tool for annotating and assembling Western blot figures* (2026).
+# GitHub: https://github.com/masha-rgfj/wbtool-fiji-plugin
+
 from ij import IJ, ImagePlus, Prefs
 from ij.gui import GenericDialog, Overlay, Line, TextRoi
 from ij.process import ImageConverter
