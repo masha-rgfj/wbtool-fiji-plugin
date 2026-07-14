@@ -4,7 +4,7 @@ from ij.process import ImageConverter
 import java.awt as awt
 from java.awt import (Color, Font, BasicStroke, RenderingHints,
                       BorderLayout, Dimension)
-from java.awt.geom import GeneralPath
+from java.awt.geom import GeneralPath, AffineTransform
 from java.awt.event import ActionListener, MouseAdapter, MouseEvent, KeyEvent, WindowAdapter
 from javax.swing import (JFrame, JPanel, JButton, JLabel, JSeparator,
                          JScrollPane, JList, DefaultListModel,
@@ -12,14 +12,13 @@ from javax.swing import (JFrame, JPanel, JButton, JLabel, JSeparator,
                          JOptionPane, BoxLayout, Box, JFileChooser,
                          KeyStroke, AbstractAction, JTextArea)
 from javax.swing.filechooser import FileNameExtensionFilter
-from com.itextpdf.text import Document as PdfDocument, Image as PdfImage
+from com.itextpdf.text import Document as PdfDocument
 from com.itextpdf.text.pdf import PdfWriter
 import math
 from java.io import FileOutputStream
 from java.awt.image import BufferedImage
 from javax.imageio import ImageIO
 import java.io.File as JFile
-import java.io.ByteArrayOutputStream as ByteArrayOutputStream
 TICK_LEN     = 20
 TICK_GAP     = 4
 LEFT_MARGIN  = 90
@@ -215,6 +214,85 @@ def crop_imp(imp, x, y, w, h):
     cropped = imp.crop()
     imp.killRoi()
     return cropped
+def open_rgb_image(parent, last_dir):
+    fc = JFileChooser()
+    fc.setFileFilter(FileNameExtensionFilter(
+        "Image files", ["tif","tiff","png","jpg","jpeg"]))
+    if last_dir is not None:
+        fc.setCurrentDirectory(JFile(last_dir))
+    if fc.showOpenDialog(parent) != JFileChooser.APPROVE_OPTION:
+        return None, last_dir
+    chosen = fc.getSelectedFile()
+    new_last_dir = chosen.getParent()
+    Prefs.set("wbtool.last_dir", new_last_dir)
+    path = chosen.getAbsolutePath()
+    imp = IJ.openImage(path)
+    if imp is None:
+        JOptionPane.showMessageDialog(parent,
+            "Could not open: " + path, "Error",
+            JOptionPane.ERROR_MESSAGE)
+        return None, new_last_dir
+    if imp.getType() != ImagePlus.COLOR_RGB:
+        ImageConverter(imp).convertToRGB()
+    return imp, new_last_dir
+def show_image_right_half(imp):
+    imp.show()
+    screen = awt.Toolkit.getDefaultToolkit().getScreenSize()
+    win = imp.getWindow()
+    if win is not None:
+        win.setLocation(screen.width // 2, 0)
+        win.setSize(screen.width // 2, screen.height)
+def set_crop_selection_tool():
+    try:
+        IJ.setTool("rotated rectangle")
+    except:
+        IJ.setTool("rectangle")
+def rotated_crop_from_roi(imp, roi):
+    bounds = roi.getBounds()
+    x, y, w, h = bounds.x, bounds.y, bounds.width, bounds.height
+    angle = 0.0
+    try:
+        fp = roi.getFloatPolygon()
+    except:
+        fp = None
+    if fp is not None and fp.npoints >= 4:
+        xs = [fp.xpoints[i] for i in range(fp.npoints)]
+        ys = [fp.ypoints[i] for i in range(fp.npoints)]
+        p0 = (float(xs[0]), float(ys[0]))
+        p1 = (float(xs[1]), float(ys[1]))
+        p2 = (float(xs[2]), float(ys[2]))
+        side_w = dist2(p0[0], p0[1], p1[0], p1[1])
+        side_h = dist2(p1[0], p1[1], p2[0], p2[1])
+        if side_w >= 2 and side_h >= 2:
+            x = p0[0]; y = p0[1]
+            w = int(round(side_w)); h = int(round(side_h))
+            angle = math.atan2(p1[1] - p0[1], p1[0] - p0[0])
+    if w < 2 or h < 2:
+        return None
+    if abs(angle) < 0.0001:
+        cropped = crop_imp(imp, int(round(x)), int(round(y)), int(round(w)), int(round(h)))
+        return cropped, float(x), float(y), int(round(w)), int(round(h)), 0.0
+    src_bi = imp.getProcessor().convertToRGB().getBufferedImage()
+    out = BufferedImage(int(round(w)), int(round(h)), BufferedImage.TYPE_INT_RGB)
+    g = out.createGraphics()
+    g.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
+                       RenderingHints.VALUE_INTERPOLATION_BICUBIC)
+    g.setColor(Color.WHITE)
+    g.fillRect(0, 0, out.getWidth(), out.getHeight())
+    c = math.cos(angle); s = math.sin(angle)
+    tx = -(c * x + s * y)
+    ty = (s * x - c * y)
+    at = AffineTransform(c, -s, s, c, tx, ty)
+    g.drawImage(src_bi, at, None)
+    g.dispose()
+    return ImagePlus("Rotated crop", out), float(x), float(y), out.getWidth(), out.getHeight(), math.degrees(angle)
+def marker_y_in_crop(marker, crop_x, crop_y, crop_angle_deg):
+    px = float(marker.get("x_abs", 0.0))
+    py = float(marker.get("y_abs", marker.get("y_orig", 0.0)))
+    a = math.radians(crop_angle_deg)
+    dx = px - crop_x
+    dy = py - crop_y
+    return -math.sin(a) * dx + math.cos(a) * dy
 def dist2(ax, ay, bx, by):
     return math.sqrt((ax - bx) ** 2 + (ay - by) ** 2)
 def sl_anchor(sl, ix, iy, dw):
@@ -238,6 +316,7 @@ class Band(object):
         self.x_offset = 0.0
         self.y_offset = 0.0
         self.crop_x=None; self.crop_y=None; self.crop_w=None; self.crop_h=None
+        self.crop_angle=0.0
     def scale(self):
         return float(self.display_w) / float(self.orig_w)
     def display_h(self):
@@ -337,35 +416,33 @@ class FigureRenderer(object):
         tri.x1 = img_x + tri.x1_frac * dw
         tri.y = img_y + tri.y_frac * dh
         tri.height = max(4.0, tri.h_frac * dh)
-    def render(self, bands, hlines, triangles, freetexts, canvas_w,
-               selected=None, edit_mode=False):
-        for hl in hlines:
-            self.recompute_hline(hl, bands)
-        for tri in triangles:
-            self.recompute_triangle(tri, bands)
+    def canvas_height(self, bands, hlines, triangles, freetexts):
         if not bands and not hlines and not triangles and not freetexts:
-            bi = BufferedImage(canvas_w, 300, BufferedImage.TYPE_INT_RGB)
-            g  = bi.createGraphics()
-            g.setColor(Color.WHITE);  g.fillRect(0, 0, canvas_w, 300)
-            g.setColor(Color.LIGHT_GRAY)
-            g.setFont(Font("Arial", Font.ITALIC, 14))
-            g.drawString("No bands yet — crop from the gel image", 40, 150)
-            g.dispose()
-            return bi
+            return 300
         total_h = TOP_MARGIN
         for i, b in enumerate(bands):
             rect = self.band_img_rect(i, bands)
             if rect is not None:
                 ix, iy, dw, dh = rect
                 total_h = max(total_h, iy + dh + self.band_extra_bottom(b) + BAND_GAP)
-        total_h = max(total_h, 300)
-        bi = BufferedImage(canvas_w, total_h, BufferedImage.TYPE_INT_RGB)
-        g  = bi.createGraphics()
+        return max(total_h, 300)
+    def draw(self, g, bands, hlines, triangles, freetexts, canvas_w,
+             selected=None, edit_mode=False):
+        for hl in hlines:
+            self.recompute_hline(hl, bands)
+        for tri in triangles:
+            self.recompute_triangle(tri, bands)
+        total_h = self.canvas_height(bands, hlines, triangles, freetexts)
         g.setRenderingHint(RenderingHints.KEY_ANTIALIASING,
                            RenderingHints.VALUE_ANTIALIAS_ON)
         g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING,
                            RenderingHints.VALUE_TEXT_ANTIALIAS_ON)
         g.setColor(Color.WHITE);  g.fillRect(0, 0, canvas_w, total_h)
+        if not bands and not hlines and not triangles and not freetexts:
+            g.setColor(Color.LIGHT_GRAY)
+            g.setFont(Font("Arial", Font.ITALIC, 14))
+            g.drawString("No bands yet — crop from the gel image", 40, 150)
+            return
         y_cursor = TOP_MARGIN
         for idx, b in enumerate(bands):
             sc    = b.scale()
@@ -521,6 +598,13 @@ class FigureRenderer(object):
                     0, [3, 3], 0))
                 g.drawRect(int(rx), int(ry), int(rw), int(rh))
                 g.setStroke(BasicStroke(1.0))
+    def render(self, bands, hlines, triangles, freetexts, canvas_w,
+               selected=None, edit_mode=False):
+        total_h = self.canvas_height(bands, hlines, triangles, freetexts)
+        bi = BufferedImage(canvas_w, total_h, BufferedImage.TYPE_INT_RGB)
+        g = bi.createGraphics()
+        self.draw(g, bands, hlines, triangles, freetexts, canvas_w,
+                  selected, edit_mode)
         g.dispose()
         return bi
 class FigureCanvas(JPanel):
@@ -618,15 +702,7 @@ class FigureCanvas(JPanel):
                         canvas.ctrl._set_status("Dragging gel crop")
             def mouseClicked(self, event):
                 if canvas.mode == "edit" and event.getClickCount() == 2:
-                    a = canvas.ctrl.selected_annot
-                    if isinstance(a, FreeText):
-                        canvas.ctrl.rename_selected_text()
-                    elif isinstance(a, tuple) and a[0] == "sl":
-                        canvas.ctrl.rename_selected_sl()
-                    elif isinstance(a, tuple) and a[0] == "ba":
-                        canvas.ctrl.rename_selected_ba()
-                    elif isinstance(a, tuple) and a[0] == "protein":
-                        canvas.ctrl.rename_selected_protein()
+                    canvas.ctrl.rename_selected()
             def mouseDragged(self, event):
                 x, y = event.getX(), event.getY()
                 if canvas.mode == "draw_line" and canvas._drag_start:
@@ -684,7 +760,9 @@ class WBTool(ActionListener):
         self.freetexts            = []
         self.sel_idx              = -1
         self.gel_imp              = None
+        self.workflow_mode        = "single"
         self.kda_markers          = []
+        self.kda_marker_lanes     = []
         self.kda_mode_active      = False
         self._waiting_for_crop    = False
         self._crop_was_marking    = False
@@ -730,11 +808,14 @@ class WBTool(ActionListener):
             ctrl.add(b);  ctrl.add(Box.createVerticalStrut(3))
             return b
         section("Image")
-        btn("Open Gel Image...", "open_image")
+        btn("Single Image Mode...", "open_image")
+        btn("Separate Marker/Blot...", "open_marker_image")
         ctrl.add(Box.createVerticalStrut(6))
         section("kDa Markers")
         self.btn_mark_kda = btn("Mark kDa Bands", "toggle_mark_kda")
         self.btn_mark_kda.setOpaque(True)
+        self.btn_apply_markers = btn("Apply Markers to Blot...", "apply_markers_to_blot")
+        self.btn_apply_markers.setOpaque(True)
         btn("Undo Last kDa", "undo_kda")
         btn("Clear All kDa", "clear_kda")
         ctrl.add(Box.createVerticalStrut(6))
@@ -842,6 +923,7 @@ class WBTool(ActionListener):
                 "y_offset": getattr(b, "y_offset", 0.0),
                 "crop_x": getattr(b,"crop_x",None), "crop_y": getattr(b,"crop_y",None),
                 "crop_w": getattr(b,"crop_w",None), "crop_h": getattr(b,"crop_h",None),
+                "crop_angle": getattr(b,"crop_angle",0.0),
                 "kda_markers": [dict(m) for m in b.kda_markers],
                 "sample_labels": [dict(sl) for sl in b.sample_labels],
                 "band_annots": [dict(ba) for ba in b.band_annots],
@@ -881,6 +963,7 @@ class WBTool(ActionListener):
             b.y_offset = bs.get("y_offset", 0.0)
             b.crop_x=bs.get("crop_x",None); b.crop_y=bs.get("crop_y",None)
             b.crop_w=bs.get("crop_w",None); b.crop_h=bs.get("crop_h",None)
+            b.crop_angle=bs.get("crop_angle",0.0)
             b.kda_markers = [dict(m) for m in bs["kda_markers"]]
             b.sample_labels = [dict(sl) for sl in bs["sample_labels"]]
             b.band_annots = [dict(ba) for ba in bs["band_annots"]]
@@ -950,6 +1033,8 @@ class WBTool(ActionListener):
         cmd = event.getActionCommand()
         {
             "open_image":          self.open_image,
+            "open_marker_image":   self.open_marker_image,
+            "apply_markers_to_blot": self.apply_markers_to_blot,
             "toggle_mark_kda":     self.toggle_mark_kda,
             "undo_kda":            self.undo_last_kda,
             "clear_kda":           self.clear_all_kda,
@@ -979,36 +1064,60 @@ class WBTool(ActionListener):
             "clear_figure":        self.clear_figure,
         }.get(cmd, lambda: None)()
     def open_image(self):
-        fc = JFileChooser()
-        fc.setFileFilter(FileNameExtensionFilter(
-            "Image files", ["tif","tiff","png","jpg","jpeg"]))
-        if self._last_dir is not None:
-            fc.setCurrentDirectory(JFile(self._last_dir))
-        if fc.showOpenDialog(self.frame) != JFileChooser.APPROVE_OPTION:
-            return
-        chosen = fc.getSelectedFile()
-        self._last_dir = chosen.getParent()
-        Prefs.set("wbtool.last_dir", self._last_dir)
-        path = chosen.getAbsolutePath()
-        imp  = IJ.openImage(path)
+        imp, self._last_dir = open_rgb_image(self.frame, self._last_dir)
         if imp is None:
-            JOptionPane.showMessageDialog(self.frame,
-                "Could not open: " + path, "Error",
-                JOptionPane.ERROR_MESSAGE)
             return
-        if imp.getType() != ImagePlus.COLOR_RGB:
-            ImageConverter(imp).convertToRGB()
         if self.kda_mode_active:
             self._deactivate_kda_mode()
+        self.workflow_mode = "single"
         self.gel_imp     = imp
         self.kda_markers = []
-        imp.show()
-        screen = awt.Toolkit.getDefaultToolkit().getScreenSize()
-        win = imp.getWindow()
-        if win is not None:
-            win.setLocation(screen.width // 2, 0)
-            win.setSize(screen.width // 2, screen.height)
-        IJ.setTool("rectangle")
+        show_image_right_half(imp)
+        set_crop_selection_tool()
+        self._set_status("Single image mode -- mark kDa bands or crop directly")
+    def open_marker_image(self):
+        imp, self._last_dir = open_rgb_image(self.frame, self._last_dir)
+        if imp is None:
+            return
+        if self.kda_mode_active:
+            self._deactivate_kda_mode()
+        self.workflow_mode = "paired_marker"
+        self.gel_imp = imp
+        self.kda_markers = []
+        show_image_right_half(imp)
+        self._activate_kda_mode()
+        self._set_status("Paired mode -- mark the marker image, then apply markers to blot")
+    def apply_markers_to_blot(self):
+        if self.workflow_mode not in ("paired_marker","paired_blot"):
+            JOptionPane.showMessageDialog(self.frame,
+                "Start with Separate Marker/Blot, then mark the ladder bands.",
+                "Not in paired mode", JOptionPane.WARNING_MESSAGE)
+            return
+        if not self.kda_markers:
+            JOptionPane.showMessageDialog(self.frame,
+                "Mark at least one kDa band on the marker image first.",
+                "No markers", JOptionPane.WARNING_MESSAGE)
+            return
+        marker_w = self.gel_imp.getWidth() if self.gel_imp is not None else None
+        marker_h = self.gel_imp.getHeight() if self.gel_imp is not None else None
+        self._remember_kda_lane()
+        was_marking = self.kda_mode_active
+        if self.kda_mode_active:
+            self._deactivate_kda_mode()
+        imp, self._last_dir = open_rgb_image(self.frame, self._last_dir)
+        if imp is None:
+            if was_marking: self._activate_kda_mode()
+            return
+        if marker_w is not None and (imp.getWidth() != marker_w or imp.getHeight() != marker_h):
+            JOptionPane.showMessageDialog(self.frame,
+                "The marker and blot images should have the same width and height.",
+                "Image size mismatch", JOptionPane.WARNING_MESSAGE)
+        self.workflow_mode = "paired_blot"
+        self.gel_imp = imp
+        show_image_right_half(imp)
+        self._redraw_kda_overlay()
+        set_crop_selection_tool()
+        self._set_status("Markers applied to blot -- draw a crop, rotate if needed, then confirm")
     def toggle_mark_kda(self):
         if self.gel_imp is None:
             JOptionPane.showMessageDialog(self.frame,
@@ -1058,7 +1167,7 @@ class WBTool(ActionListener):
         self._gel_mouse_listener           = None
         self._saved_mouse_listeners        = []
         self._saved_mouse_motion_listeners = []
-        IJ.setTool("rectangle")
+        set_crop_selection_tool()
     def _on_gel_click(self, scene_x, scene_y):
         val = ask_string("kDa value", "Enter kDa label for this band:", "0")
         if val is None:
@@ -1098,20 +1207,50 @@ class WBTool(ActionListener):
             self._set_status("kDa marking active -- click gel")
     def _fc(self,v):
         return "NA" if v is None else ("%.2f"%v if isinstance(v,float) else str(v))
+    def _same_lane(self,a,b):
+        if len(a)!=len(b): return False
+        for x,y in zip(a,b):
+            if x.get("kda")!=y.get("kda"): return False
+            if self._fc(x.get("x_abs",None))!=self._fc(y.get("x_abs",None)): return False
+            if self._fc(x.get("y_abs",x.get("y_orig",None)))!=self._fc(y.get("y_abs",y.get("y_orig",None))): return False
+        return True
+    def _remember_kda_lane(self):
+        if not self.kda_markers: return
+        lane=[dict(m) for m in self.kda_markers]
+        if not self.kda_marker_lanes or not self._same_lane(self.kda_marker_lanes[-1],lane):
+            self.kda_marker_lanes.append(lane)
     def coordinate_log_text(self):
         a=["WBTool Coordinate Log",""]
         if self.gel_imp is not None:
             a+=["Source image: "+self.gel_imp.getTitle(),"Source size: width=%d, height=%d"%(self.gel_imp.getWidth(),self.gel_imp.getHeight()),""]
         a.append("Global kDa markers (absolute source-image coordinates):")
-        if self.kda_markers:
-            for i,m in enumerate(self.kda_markers):
-                a.append("  %d. label=%s, x_abs=%s, y_abs=%s"%(i+1,kda_label_text(m["kda"]),self._fc(m.get("x_abs",None)),self._fc(m.get("y_abs",m.get("y_orig",None)))))
+        lanes=[list(l) for l in self.kda_marker_lanes]
+        if self.kda_markers and (not lanes or not self._same_lane(lanes[-1],self.kda_markers)):
+            lanes.append(self.kda_markers)
+        if lanes:
+            for li,lane in enumerate(lanes):
+                a.append("  Lane %d:"%(li+1))
+                for i,m in enumerate(lane):
+                    a.append("    %d. label=%s, x_abs=%s, y_abs=%s"%(i+1,kda_label_text(m["kda"]),self._fc(m.get("x_abs",None)),self._fc(m.get("y_abs",m.get("y_orig",None)))))
         else: a.append("  none")
         a+=["","Crops in figure:"]
         if self.bands:
             for i,b in enumerate(self.bands):
-                a.append("  Band %d: %s"%(i+1,plain_text(b.protein_name)))
-                a.append("    crop_abs: x=%s, y=%s, width=%s, height=%s"%(self._fc(getattr(b,"crop_x",None)),self._fc(getattr(b,"crop_y",None)),self._fc(getattr(b,"crop_w",None)),self._fc(getattr(b,"crop_h",None))))
+                ml="none"
+                if b.kda_markers:
+                    for li,lane in enumerate(lanes):
+                        ok=True
+                        for bm in b.kda_markers:
+                            hit=False
+                            for m in lane:
+                                if bm.get("kda")==m.get("kda") and self._fc(bm.get("x_abs",None))==self._fc(m.get("x_abs",None)) and self._fc(bm.get("y_abs",None))==self._fc(m.get("y_abs",m.get("y_orig",None))):
+                                    hit=True; break
+                            if not hit:
+                                ok=False; break
+                        if ok:
+                            ml=str(li+1); break
+                a.append("  Band %d: marker lane %s, %s"%(i+1,ml,plain_text(b.protein_name)))
+                a.append("    crop_abs: x=%s, y=%s, width=%s, height=%s, angle=%s"%(self._fc(getattr(b,"crop_x",None)),self._fc(getattr(b,"crop_y",None)),self._fc(getattr(b,"crop_w",None)),self._fc(getattr(b,"crop_h",None)),self._fc(getattr(b,"crop_angle",0.0))))
                 if b.kda_markers:
                     for m in b.kda_markers:
                         a.append("      label=%s, x_abs=%s, y_abs=%s, y_in_crop=%s"%(kda_label_text(m["kda"]),self._fc(m.get("x_abs",None)),self._fc(m.get("y_abs",None)),self._fc(m.get("y_orig",None))))
@@ -1131,10 +1270,10 @@ class WBTool(ActionListener):
             self._waiting_for_crop = True
             self._crop_was_marking = self.kda_mode_active
             if self.kda_mode_active: self._deactivate_kda_mode()
-            IJ.setTool("rectangle")
+            set_crop_selection_tool()
             self.btn_crop.setBackground(COLOR_ACTIVE)
             self.btn_crop.setText("Confirm Crop")
-            self._set_status("Draw a rectangle on the gel, then click Confirm Crop")
+            self._set_status("Draw a crop on the gel; rotate it if needed, then click Confirm Crop")
             return
         self._waiting_for_crop = False
         self.btn_crop.setBackground(COLOR_INACTIVE)
@@ -1147,20 +1286,27 @@ class WBTool(ActionListener):
                 "No selection", JOptionPane.WARNING_MESSAGE)
             if self._crop_was_marking: self._activate_kda_mode()
             return
-        bounds = roi.getBounds()
-        x, y, w, h = bounds.x, bounds.y, bounds.width, bounds.height
-        if w < 2 or h < 2:
+        crop_data = rotated_crop_from_roi(self.gel_imp, roi)
+        if crop_data is None:
             JOptionPane.showMessageDialog(self.frame,
                 "Selection too small -- please try again.",
                 "Too small", JOptionPane.WARNING_MESSAGE)
             if self._crop_was_marking: self._activate_kda_mode()
             return
-        cropped = crop_imp(self.gel_imp, x, y, w, h)
-        inside  = [m for m in self.kda_markers if y <= m["y_orig"] <= y + h]
-        local_m = [{"y_orig": m["y_orig"] - y, "x_abs":m.get("x_abs",None), "y_abs":m.get("y_abs",m["y_orig"]), "kda": m["kda"],
-                    "font_size": m.get("font_size",
-                                       self.default_font_sizes["kda"])}
-                   for m in inside]
+        cropped, x, y, w, h, angle = crop_data
+        self._remember_kda_lane()
+        local_m = []
+        for m in self.kda_markers:
+            yy = marker_y_in_crop(m, x, y, angle)
+            if -0.5 <= yy <= h + 0.5:
+                local_m.append({"y_orig": yy,
+                                "x_abs": m.get("x_abs", None),
+                                "y_abs": m.get("y_abs", m.get("y_orig", None)),
+                                "crop_angle": angle,
+                                "kda": m["kda"],
+                                "font_size": m.get("font_size",
+                                                   self.default_font_sizes["kda"])})
+        local_m.sort(key=lambda d: d["y_orig"])
         protein = ask_string("Protein name", "Enter protein name:", "Protein")
         if protein is None:
             if self._crop_was_marking: self._activate_kda_mode()
@@ -1169,6 +1315,7 @@ class WBTool(ActionListener):
                     width=self.bands[-1].display_w if self.bands else None)
         band.protein_size = self.default_font_sizes["protein"]
         band.crop_x=x; band.crop_y=y; band.crop_w=w; band.crop_h=h
+        band.crop_angle=angle
         self._record_undo()
         self.bands.append(band)
         self.list_model.addElement(protein or "Protein")
@@ -1658,16 +1805,8 @@ class WBTool(ActionListener):
             self._set_status("Selected: H-Line  |  drag handles or body")
         elif isinstance(best, TriangleAnnot):
             self._set_status("Selected: triangle  |  drag body or handles")
-        elif isinstance(best, FreeText):
-            self._set_status("Selected: \"%s\"  |  drag / dbl-click to rename" % plain_text(best.text))
-        elif isinstance(best, tuple) and best[0] == "sl":
-            self._set_status("Selected: label \"%s\"  |  dbl-click to rename, Del to delete" % plain_text(best[2]["text"]))
-        elif isinstance(best, tuple) and best[0] == "ba":
-            self._set_status("Selected: band tick \"%s\"  |  drag up/down, dbl-click to rename" % plain_text(best[2]["text"]))
-        elif isinstance(best, tuple) and best[0] == "kda":
-            self._set_status("Selected: kDa label \"%s\"  |  A-/A+ to resize" % kda_label_text(best[2]["kda"]))
-        elif isinstance(best, tuple) and best[0] == "protein":
-            self._set_status("Selected: protein name \"%s\"  |  drag/nudge, A-/A+ to resize" % plain_text(best[1].protein_name))
+        elif self._is_text_selection(best):
+            self._set_status(self._text_selection_status(best))
         self._refresh_figure()
     def drag_annot(self, target, dx, dy):
         a = self.selected_annot
@@ -1785,18 +1924,73 @@ class WBTool(ActionListener):
         self._refresh_figure()
     def _clamp_font_size(self, size):
         return int(max(5, min(72, size)))
+    def _text_selection_parts(self, a=None):
+        if a is None:
+            a = self.selected_annot
+        if isinstance(a, FreeText):
+            return ("free", None, a)
+        if isinstance(a, tuple):
+            if a[0] == "sl":      return ("sample", a[1], a[2])
+            if a[0] == "ba":      return ("band", a[1], a[2])
+            if a[0] == "kda":     return ("kda", a[1], a[2])
+            if a[0] == "protein": return ("protein", a[1], a[1])
+        return None
+    def _is_text_selection(self, a=None):
+        return self._text_selection_parts(a) is not None
+    def _text_default_size(self, kind):
+        return {
+            "kda": FONT_KDA.getSize(),
+            "sample": FONT_SAMPLE.getSize(),
+            "free": FONT_ANNOT.getSize(),
+            "band": FONT_BANDANN.getSize(),
+            "protein": FONT_NAME.getSize(),
+        }.get(kind, FONT_ANNOT.getSize())
+    def _text_value(self, kind, obj):
+        if kind == "free": return obj.text
+        if kind == "protein": return obj.protein_name
+        if kind == "kda": return kda_label_text(obj["kda"])
+        return obj["text"]
+    def _set_text_value(self, kind, owner, obj, value):
+        if kind == "free":
+            obj.text = value
+        elif kind == "protein":
+            obj.protein_name = value
+            if owner in self.bands:
+                self.list_model.set(self.bands.index(owner), value)
+        elif kind in ("sample", "band"):
+            obj["text"] = value
+    def _text_rename_title(self, kind):
+        return {
+            "free": "Rename",
+            "sample": "Rename label",
+            "band": "Rename band annotation",
+            "protein": "Rename protein",
+        }.get(kind, None)
+    def _text_selection_status(self, a):
+        parts = self._text_selection_parts(a)
+        if parts is None: return "Edit mode -- click to select"
+        kind, owner, obj = parts
+        txt = plain_text(self._text_value(kind, obj))
+        if kind == "free":
+            return "Selected: \"%s\"  |  drag / dbl-click to rename" % txt
+        if kind == "sample":
+            return "Selected: label \"%s\"  |  dbl-click to rename, Del to delete" % txt
+        if kind == "band":
+            return "Selected: band tick \"%s\"  |  drag up/down, dbl-click to rename" % txt
+        if kind == "kda":
+            return "Selected: kDa label \"%s\"  |  A-/A+ to resize" % txt
+        return "Selected: protein name \"%s\"  |  drag/nudge, A-/A+ to resize" % txt
     def _resize_item(self, kind, obj, delta):
         if kind == "protein":
             obj.protein_size = self._clamp_font_size(
                 getattr(obj, "protein_size", FONT_NAME.getSize()) + delta)
+        elif kind == "free":
+            obj.font_size = self._clamp_font_size(
+                getattr(obj, "font_size", FONT_ANNOT.getSize()) + delta)
         else:
-            base = {
-                "kda": FONT_KDA.getSize(),
-                "sample": FONT_SAMPLE.getSize(),
-                "free": FONT_ANNOT.getSize(),
-                "band": FONT_BANDANN.getSize(),
-            }.get(kind, FONT_ANNOT.getSize())
-            obj["font_size"] = self._clamp_font_size(obj.get("font_size", base) + delta)
+            base = self._text_default_size(kind)
+            obj["font_size"] = self._clamp_font_size(
+                obj.get("font_size", base) + delta)
     def _resize_all_text(self, delta):
         for k in self.default_font_sizes:
             self.default_font_sizes[k] = self._clamp_font_size(
@@ -1810,26 +2004,13 @@ class WBTool(ActionListener):
             for ba in b.band_annots:
                 self._resize_item("band", ba, delta)
         for ft in self.freetexts:
-            ft.font_size = self._clamp_font_size(
-                getattr(ft, "font_size", FONT_ANNOT.getSize()) + delta)
+            self._resize_item("free", ft, delta)
     def resize_text(self, delta):
-        a = self.selected_annot
-        changed_one = False
         self._record_undo()
-        if isinstance(a, FreeText):
-            a.font_size = self._clamp_font_size(
-                getattr(a, "font_size", FONT_ANNOT.getSize()) + delta)
-            changed_one = True
-        elif isinstance(a, tuple):
-            if a[0] == "sl":
-                self._resize_item("sample", a[2], delta);  changed_one = True
-            elif a[0] == "ba":
-                self._resize_item("band", a[2], delta);  changed_one = True
-            elif a[0] == "kda":
-                self._resize_item("kda", a[2], delta);  changed_one = True
-            elif a[0] == "protein":
-                self._resize_item("protein", a[1], delta);  changed_one = True
-        if changed_one:
+        parts = self._text_selection_parts()
+        if parts is not None:
+            kind, owner, obj = parts
+            self._resize_item(kind, obj, delta)
             self._set_status("Resized selected text")
         else:
             self._resize_all_text(delta)
@@ -1865,53 +2046,15 @@ class WBTool(ActionListener):
         self._refresh_figure()
     def rename_selected(self):
         """Button-triggered rename — works for FreeText and sample labels."""
-        a = self.selected_annot
-        if isinstance(a, FreeText):
-            self.rename_selected_text()
-        elif isinstance(a, tuple) and a[0] == "sl":
-            self.rename_selected_sl()
-        elif isinstance(a, tuple) and a[0] == "ba":
-            self.rename_selected_ba()
-        elif isinstance(a, tuple) and a[0] == "protein":
-            self.rename_selected_protein()
-    def rename_selected_text(self):
-        a = self.selected_annot
-        if a is None or not isinstance(a, FreeText): return
-        new_text = ask_string("Rename", "New text:", a.text)
+        parts = self._text_selection_parts()
+        if parts is None: return
+        kind, owner, obj = parts
+        title = self._text_rename_title(kind)
+        if title is None: return
+        new_text = ask_string(title, "New text:", self._text_value(kind, obj))
         if new_text is not None:
             self._record_undo()
-            a.text = new_text;  self._refresh_figure()
-    def rename_selected_sl(self):
-        """Rename (and keep angle) for a selected sample label."""
-        a = self.selected_annot
-        if not (isinstance(a, tuple) and a[0] == "sl"): return
-        _, b, sl = a
-        new_text = ask_string("Rename label", "New text:", sl["text"])
-        if new_text is not None:
-            self._record_undo()
-            sl["text"] = new_text
-            self._refresh_figure()
-    def rename_selected_ba(self):
-        """Rename a selected right-side band annotation."""
-        a = self.selected_annot
-        if not (isinstance(a, tuple) and a[0] == "ba"): return
-        _, b, ba = a
-        new_text = ask_string("Rename band annotation", "New text:", ba["text"])
-        if new_text is not None:
-            self._record_undo()
-            ba["text"] = new_text
-            self._refresh_figure()
-    def rename_selected_protein(self):
-        a = self.selected_annot
-        if not (isinstance(a, tuple) and a[0] == "protein"): return
-        _, b = a
-        new_text = ask_string("Rename protein", "New text:", b.protein_name)
-        if new_text is not None:
-            self._record_undo()
-            b.protein_name = new_text
-            if b in self.bands:
-                idx = self.bands.index(b)
-                self.list_model.set(idx, new_text)
+            self._set_text_value(kind, owner, obj, new_text)
             self._refresh_figure()
     def delete_selected_annot(self):
         a = self.selected_annot
@@ -1921,16 +2064,16 @@ class WBTool(ActionListener):
             self.hlines.remove(a)
         elif isinstance(a, TriangleAnnot) and a in self.triangles:
             self.triangles.remove(a)
-        elif isinstance(a, FreeText) and a in self.freetexts:
-            self.freetexts.remove(a)
-        elif isinstance(a, tuple) and a[0] == "sl":
-            _, b, sl = a
-            if sl in b.sample_labels:
-                b.sample_labels.remove(sl)
-        elif isinstance(a, tuple) and a[0] == "ba":
-            _, b, ba = a
-            if ba in b.band_annots:
-                b.band_annots.remove(ba)
+        else:
+            parts = self._text_selection_parts(a)
+            if parts is not None:
+                kind, owner, obj = parts
+                if kind == "free" and obj in self.freetexts:
+                    self.freetexts.remove(obj)
+                elif kind == "sample" and obj in owner.sample_labels:
+                    owner.sample_labels.remove(obj)
+                elif kind == "band" and obj in owner.band_annots:
+                    owner.band_annots.remove(obj)
         self.selected_annot = None
         self._set_status("Edit mode -- click to select")
         self._refresh_figure()
@@ -1989,149 +2132,23 @@ class WBTool(ActionListener):
         path = self._choose_save_path("Export PDF", "PDF", "pdf")
         if path is None: return
         from com.itextpdf.text import Rectangle as PdfRect
-        from com.itextpdf.text.pdf import PdfContentByte, BaseFont
-        for hl in self.hlines:
-            self.renderer.recompute_hline(hl, self.bands)
         cw = self._canvas_width()
-        th = TOP_MARGIN
-        for i, b in enumerate(self.bands):
-            rect = self.renderer.band_img_rect(i, self.bands)
-            if rect is not None:
-                ix, iy, dw, dh = rect
-                th = max(th, iy + dh + self.renderer.band_extra_bottom(b) + BAND_GAP)
-        th = max(th, 300)
-        pw = cw * spt;  ph = th * spt
+        ch = self.renderer.canvas_height(self.bands, self.hlines,
+                                         self.triangles, self.freetexts)
+        pw = cw * spt;  ph = ch * spt
         doc    = PdfDocument(PdfRect(pw, ph), 0, 0, 0, 0)
         fos    = FileOutputStream(path)
         writer = PdfWriter.getInstance(doc, fos)
         doc.open()
         cb = writer.getDirectContent()
-        bf = BaseFont.createFont(BaseFont.HELVETICA,
-                                 BaseFont.WINANSI, BaseFont.NOT_EMBEDDED)
-        def pt(px):   return float(px) * spt
-        def fy(ypx):  return ph - float(ypx) * spt
-        def font_pt(font, size=None):
-            return float(size if size is not None else font.getSize()) * spt
-        def pdf_line(x0, y0, x1, y1, w=1.0):
-            cb.setLiteral("0 G\n%.3f w\n%f %f m %f %f l S\n" % (w*spt,x0,y0,x1,y1))
-        def pdf_rect(x, y, w, h):
-            cb.setLiteral("0 G\n%.3f w\n%f %f %f %f re S\n" % (1.5*spt,x,y,w,h))
-        def pdf_triangle(tri):
-            pts = tri.points()
-            coords = [(pt(x), fy(y)) for x, y in pts]
-            cb.setLiteral(
-                "0 g\n%f %f m %f %f l %f %f l h f\n" % (
-                    coords[0][0], coords[0][1],
-                    coords[1][0], coords[1][1],
-                    coords[2][0], coords[2][1]))
-        def pdf_text(text, size, x, y, cos_a=1.0, sin_a=0.0):
-            cb.setLiteral("BT\n")
-            cb.setFontAndSize(bf, size)
-            cb.setLiteral("0 g\n%f %f %f %f %f %f Tm\n" % (
-                cos_a, sin_a, -sin_a, cos_a, x, y))
-            safe = text.replace("\\","\\\\").replace("(","\\(").replace(")","\\)")
-            cb.setLiteral("(%s) Tj\nET\n" % safe)
-        def pdf_rich_width(text, size):
-            max_width = 0.0
-            for line in rich_text_lines(text):
-                width = 0.0
-                for kind, part in rich_text_runs(line):
-                    fs = size if kind == "normal" else size * 0.70
-                    width += bf.getWidthPoint(part, fs)
-                max_width = max(max_width, width)
-            return max_width
-        def pdf_rich_line(text, size, x, y, cos_a=1.0, sin_a=0.0):
-            advance = 0.0
-            shift = size * 0.38
-            for kind, part in rich_text_runs(text):
-                if kind == "normal":
-                    fs = size
-                    dy = 0.0
-                else:
-                    fs = size * 0.70
-                    dy = shift if kind == "sup" else -shift * 0.55
-                tx = x + cos_a * advance - sin_a * dy
-                ty = y + sin_a * advance + cos_a * dy
-                pdf_text(part, fs, tx, ty,
-                         cos_a, sin_a)
-                advance += bf.getWidthPoint(part, fs)
-        def pdf_rich_text(text, size, x, y, cos_a=1.0, sin_a=0.0):
-            line_h = size * 1.25
-            for i, line in enumerate(rich_text_lines(text)):
-                pdf_rich_line(line, size, x, y - i * line_h, cos_a, sin_a)
-        def pdf_center_y(text, size, y_center):
-            asc = bf.getAscentPoint(text, size)
-            desc = bf.getDescentPoint(text, size)
-            return y_center - (asc + desc) / 2.0
-        for i, b in enumerate(self.bands):
-            sc = b.scale();  dw = b.display_w;  dh = b.display_h()
-            ix, iy, dw, dh = self.renderer.band_img_rect(i, self.bands)
-            orig_bi   = b.orig_imp.getProcessor().convertToRGB().getBufferedImage()
-            scaled_bi = BufferedImage(dw, dh, BufferedImage.TYPE_INT_RGB)
-            sg = scaled_bi.createGraphics()
-            sg.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
-                                RenderingHints.VALUE_INTERPOLATION_BICUBIC)
-            sg.drawImage(orig_bi, 0, 0, dw, dh, None);  sg.dispose()
-            baos = ByteArrayOutputStream()
-            ImageIO.write(scaled_bi, "PNG", baos)
-            pi = PdfImage.getInstance(baos.toByteArray())
-            pi.scaleAbsolute(pt(dw), pt(dh))
-            pi.setAbsolutePosition(pt(ix), fy(iy + dh))
-            doc.add(pi)
-            pdf_rect(pt(ix), fy(iy+dh), pt(dw), pt(dh))
-            for m in b.kda_markers:
-                ty = iy + m["y_orig"] * sc
-                x1p = ix - 2;  x0p = x1p - TICK_LEN
-                pdf_line(pt(x0p), fy(ty), pt(x1p), fy(ty), w=1.2)
-                lbl = kda_label_text(m["kda"])
-                fs = font_pt(FONT_KDA, m.get("font_size", FONT_KDA.getSize()))
-                lw  = bf.getWidthPoint(lbl, fs)
-                pdf_text(lbl, fs, pt(x0p) - TICK_GAP*spt - lw,
-                         pdf_center_y(lbl, fs, fy(ty)))
-            for ba in b.band_annots:
-                ty = iy + ba["y_frac"] * dh
-                x0p = ix + dw + 2;  x1p = x0p + TICK_LEN
-                pdf_line(pt(x0p), fy(ty), pt(x1p), fy(ty), w=1.2)
-                fs = font_pt(FONT_BANDANN,
-                             ba.get("font_size", FONT_BANDANN.getSize()))
-                pdf_rich_text(ba["text"], fs, pt(x1p + TICK_GAP),
-                              pdf_center_y(plain_text(ba["text"]), fs, fy(ty)))
-            if b.band_annots:
-                name_px = getattr(b, "protein_size", FONT_NAME.getSize())
-                fs_name = font_pt(FONT_NAME, name_px)
-                lw_name = pdf_rich_width(b.protein_name, fs_name)
-                name_dx = getattr(b, "protein_dx_frac", 0.0) * dw
-                name_dy = getattr(b, "protein_dy_frac", 0.0) * dh
-                pdf_rich_text(b.protein_name, fs_name,
-                              pt(ix + dw/2.0 + name_dx) - lw_name/2.0,
-                              fy(iy + dh + name_px + 5 + name_dy))
-            else:
-                fs_name = font_pt(FONT_NAME, getattr(b, "protein_size",
-                                                     FONT_NAME.getSize()))
-                name_dx = getattr(b, "protein_dx_frac", 0.0) * dw
-                name_dy = getattr(b, "protein_dy_frac", 0.0) * dh
-                pdf_rich_text(b.protein_name, fs_name, pt(ix+dw+10 + name_dx),
-                              fy(iy+dh/2.0 + name_dy) - fs_name*0.35)
-            for sl in b.sample_labels:
-                ax, ay = sl_anchor(sl, ix, iy, dw)
-                fs  = font_pt(FONT_SAMPLE,
-                              sl.get("font_size", FONT_SAMPLE.getSize()))
-                lw  = pdf_rich_width(sl["text"], fs)
-                tx  = pt(ax) - lw / 2.0
-                ty  = fy(ay)
-                ar  = math.radians(sl["angle"])
-                pdf_rich_text(sl["text"], fs, tx, ty,
-                              math.cos(ar), math.sin(ar))
-        for tri in self.triangles:
-            self.renderer.recompute_triangle(tri, self.bands)
-            pdf_triangle(tri)
-        for hl in self.hlines:
-            pdf_line(pt(hl.x0), fy(hl.y), pt(hl.x1), fy(hl.y), w=1.5)
-        for ft in self.freetexts:
-            pdf_rich_text(ft.text,
-                          font_pt(FONT_ANNOT, getattr(ft, "font_size",
-                                                      FONT_ANNOT.getSize())),
-                          pt(ft.x), fy(ft.y))
+        try:
+            g = cb.createGraphics(float(pw), float(ph))
+        except:
+            g = cb.createGraphicsShapes(float(pw), float(ph))
+        g.scale(spt, spt)
+        self.renderer.draw(g, self.bands, self.hlines, self.triangles,
+                           self.freetexts, cw)
+        g.dispose()
         doc.close();  fos.close()
         JOptionPane.showMessageDialog(self.frame, "PDF saved: " + path,
             "Done", JOptionPane.INFORMATION_MESSAGE)
