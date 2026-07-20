@@ -1,7 +1,7 @@
 # If you use Gelanno in published research, please cite:
 # Maria A. Pirozhkova (Masha) (RGFJ), Elisheva Babitz
 # *Gelanno: A GUI tool for annotating and assembling Western blot figures* (2026).
-# GitHub: https://github.com/masha-rgfj/wbtool-fiji-plugin
+# GitHub: https://github.com/masha-rgfj/GelAnno-fiji-plugin
 
 from ij import IJ, ImagePlus, Prefs
 from ij.gui import GenericDialog, Overlay, Line, TextRoi
