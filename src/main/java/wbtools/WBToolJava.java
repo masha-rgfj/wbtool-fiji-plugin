@@ -16,46 +16,53 @@ import ij.gui.Toolbar;
 import ij.process.ImageConverter;
 import java.awt.BasicStroke;
 import java.awt.BorderLayout;
+import java.awt.CardLayout;
 import java.awt.Color;
 import java.awt.Dimension;
 import java.awt.Font;
 import java.awt.FontMetrics;
-import java.awt.FlowLayout;
+import java.awt.GridLayout;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
 import java.awt.Point;
 import java.awt.Rectangle;
 import java.awt.RenderingHints;
 import java.awt.Toolkit;
+import java.awt.datatransfer.StringSelection;
 import java.awt.event.ActionEvent;
 import java.awt.event.ActionListener;
+import java.awt.event.FocusAdapter;
+import java.awt.event.FocusEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.event.MouseListener;
+import java.awt.event.WindowAdapter;
+import java.awt.event.WindowEvent;
 import java.awt.geom.AffineTransform;
 import java.awt.image.BufferedImage;
-import java.awt.datatransfer.StringSelection;
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
-import java.io.OutputStreamWriter;
-import java.io.Writer;
+import java.io.IOException;
 import java.lang.reflect.Method;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.text.DateFormat;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.LinkedHashMap;
-import java.util.HashSet;
+import java.util.Date;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
-import java.util.Set;
+import java.util.Properties;
+import java.util.UUID;
+import javax.imageio.ImageIO;
 import javax.swing.BorderFactory;
 import javax.swing.Box;
 import javax.swing.BoxLayout;
 import javax.swing.JButton;
-import javax.swing.JDialog;
 import javax.swing.JFileChooser;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
@@ -63,13 +70,16 @@ import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
 import javax.swing.SwingUtilities;
+import javax.swing.JTable;
 import javax.swing.JTextArea;
-import javax.swing.WindowConstants;
+import javax.swing.JTextField;
+import javax.swing.ListSelectionModel;
 import javax.swing.filechooser.FileNameExtensionFilter;
+import javax.swing.table.DefaultTableModel;
 import org.scijava.command.Command;
 import org.scijava.plugin.Plugin;
 
-@Plugin(type = Command.class, menuPath = "Plugins>WB Tools>WB Tool Java 0.3.0-alpha")
+@Plugin(type = Command.class, menuPath = "Plugins>WB Tools>WB Tool Java 0.4.0-alpha")
 public class WBToolJava implements Command {
     @Override
     public void run() {
@@ -90,8 +100,7 @@ public class WBToolJava implements Command {
         private static final int FIG_INIT_W = 900;
         private static final int TOOL_BUTTON_W = 220;
         private static final int TOOL_BUTTON_H = 30;
-        private static final String VERSION = "0.3.0-alpha";
-        private static final int LOG_FORMAT_VERSION = 1;
+        private static final String VERSION = "0.4.0-alpha";
         private static final String TITLE = "WB Tool Java " + VERSION;
         private static final Color CROP_COLOR = Color.CYAN;
         private static final float CROP_STROKE_WIDTH = 3.0f;
@@ -100,31 +109,32 @@ public class WBToolJava implements Command {
         private static final Font FONT_KDA = new Font("Arial", Font.PLAIN, 11);
         private static final Font FONT_SOURCE_KDA = new Font("Arial", Font.BOLD, 55);
         private static final Font FONT_NAME = new Font("Arial", Font.BOLD, 12);
+        private static final String CARD_HOME = "home";
+        private static final String CARD_EDITOR = "editor";
 
         private JFrame frame;
         private JLabel statusLabel;
         private JButton markButton;
         private JButton cropButton;
         private JButton sourceKdaLabelsButton;
-        private JLabel activeMarkerSetLabel;
         private FigureCanvas figureCanvas;
+        private CardLayout cards;
+        private JPanel cardPanel;
+        private DefaultTableModel historyModel;
+        private JTable historyTable;
+        private JTextField figureTitleField;
 
         private ImagePlus gelImp;
         private ImagePlus markerImp;
-        private String gelPath;
-        private String markerPath;
         private File lastDir;
-        private final List<KdaMarkerSet> markerSets = new ArrayList<KdaMarkerSet>();
+        private String gelImagePath = "";
+        private String markerImagePath = "";
+        private String openedImagePath = "";
+        private String projectId;
+        private long projectCreatedAt;
+        private final List<KdaMarker> kdaMarkers = new ArrayList<KdaMarker>();
         private final List<BandCrop> bands = new ArrayList<BandCrop>();
-        private final List<AnnotatedMarkerImage> annotatedMarkerImages =
-                new ArrayList<AnnotatedMarkerImage>();
-        private final Set<String> shownMappingWarnings = new HashSet<String>();
-        private final String windowTitle;
-
-        private KdaMarkerSet activeMarkerSet;
-        private MarkerSourceType markingSourceType;
-        private boolean startFreshMarkerSetOnNextMark;
-        private int nextMarkerSetNumber = 1;
+        private final List<FigureRecord> historyRecords = new ArrayList<FigureRecord>();
 
         private boolean kdaModeActive;
         private boolean showSourceKdaLabels = true;
@@ -133,14 +143,6 @@ public class WBToolJava implements Command {
         private MouseListener gelMouseListener;
         private ImageCanvas kdaCanvas;
         private BandCrop selectedBand;
-
-        public Controller() {
-            this(TITLE);
-        }
-
-        private Controller(String windowTitle) {
-            this.windowTitle = windowTitle;
-        }
 
         public void showFrame() {
             if (frame == null) {
@@ -151,14 +153,111 @@ public class WBToolJava implements Command {
         }
 
         private void buildUi() {
-            frame = new JFrame(windowTitle);
+            frame = new JFrame(TITLE);
             frame.setDefaultCloseOperation(JFrame.DISPOSE_ON_CLOSE);
             frame.setLayout(new BorderLayout(8, 8));
+
+            cards = new CardLayout();
+            cardPanel = new JPanel(cards);
+            cardPanel.add(buildHomePanel(), CARD_HOME);
+            cardPanel.add(buildEditorPanel(), CARD_EDITOR);
+
+            statusLabel = new JLabel(" ");
+            statusLabel.setBorder(BorderFactory.createEmptyBorder(0, 10, 8, 10));
+
+            frame.add(cardPanel, BorderLayout.CENTER);
+            frame.add(statusLabel, BorderLayout.SOUTH);
+            frame.addWindowListener(new WindowAdapter() {
+                @Override
+                public void windowClosing(WindowEvent event) {
+                    saveProject(false);
+                }
+            });
+            frame.pack();
+            placeFrameLeftHalf();
+            showHome();
+        }
+
+        private JPanel buildHomePanel() {
+            JPanel home = new JPanel(new BorderLayout(12, 12));
+            home.setBorder(BorderFactory.createEmptyBorder(24, 28, 24, 28));
+
+            JPanel heading = new JPanel();
+            heading.setLayout(new BoxLayout(heading, BoxLayout.Y_AXIS));
+            JLabel title = new JLabel("GelAnno");
+            title.setFont(title.getFont().deriveFont(Font.BOLD, 28.0f));
+            JLabel subtitle = new JLabel("Recent figures and coordinate logs");
+            subtitle.setForeground(Color.DARK_GRAY);
+            heading.add(title);
+            heading.add(Box.createVerticalStrut(4));
+            heading.add(subtitle);
+
+            JButton blank = new JButton("+  Blank figure");
+            blank.setActionCommand("new_figure");
+            blank.addActionListener(this);
+            blank.setPreferredSize(new Dimension(180, 70));
+            heading.add(Box.createVerticalStrut(18));
+            heading.add(blank);
+            home.add(heading, BorderLayout.NORTH);
+
+            historyModel = new DefaultTableModel(
+                    new Object[] {"Name", "Last modified", "Crops"}, 0) {
+                @Override
+                public boolean isCellEditable(int row, int column) {
+                    return false;
+                }
+            };
+            historyTable = new JTable(historyModel);
+            historyTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+            historyTable.setRowHeight(30);
+            historyTable.getColumnModel().getColumn(0).setPreferredWidth(390);
+            historyTable.getColumnModel().getColumn(1).setPreferredWidth(170);
+            historyTable.getColumnModel().getColumn(2).setPreferredWidth(60);
+            historyTable.addMouseListener(new MouseAdapter() {
+                @Override
+                public void mouseClicked(MouseEvent event) {
+                    if (event.getClickCount() == 2) {
+                        openSelectedHistoryFigure();
+                    }
+                }
+            });
+            JScrollPane recent = new JScrollPane(historyTable);
+            recent.setBorder(BorderFactory.createTitledBorder("Recent figures"));
+            home.add(recent, BorderLayout.CENTER);
+
+            JPanel actions = new JPanel();
+            actions.add(homeButton("Open / Edit", "open_history"));
+            actions.add(homeButton("View Coordinate Log", "view_log"));
+            actions.add(homeButton("Copy Coordinates", "copy_log"));
+            actions.add(homeButton("Delete", "delete_history"));
+            actions.add(homeButton("Refresh", "refresh_history"));
+            home.add(actions, BorderLayout.SOUTH);
+            return home;
+        }
+
+        private JButton homeButton(String label, String command) {
+            JButton button = new JButton(label);
+            button.setActionCommand(command);
+            button.addActionListener(this);
+            return button;
+        }
+
+        private JPanel buildEditorPanel() {
+            JPanel editor = new JPanel(new BorderLayout(8, 8));
 
             JPanel tools = new JPanel();
             tools.setLayout(new BoxLayout(tools, BoxLayout.Y_AXIS));
             tools.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 6));
             tools.setPreferredSize(new Dimension(TOOL_BUTTON_W + 20, 10));
+
+            addSection(tools, "GelAnno");
+            tools.add(button("Back to Home", "home"));
+            tools.add(button("New Figure", "new_figure"));
+            tools.add(Box.createVerticalStrut(8));
+
+            addSection(tools, "Image");
+            tools.add(button("Open Gel Image...", "open_image"));
+            tools.add(Box.createVerticalStrut(8));
 
             addSection(tools, "kDa Markers");
             tools.add(button("Open kDa Marker Image...", "open_marker_image"));
@@ -168,16 +267,6 @@ public class WBToolJava implements Command {
             tools.add(sourceKdaLabelsButton);
             tools.add(button("Undo Last kDa", "undo_kda"));
             tools.add(button("Clear All kDa", "clear_kda"));
-            activeMarkerSetLabel = new JLabel("Active markers: none");
-            Dimension markerLabelSize = new Dimension(TOOL_BUTTON_W, 24);
-            activeMarkerSetLabel.setMinimumSize(markerLabelSize);
-            activeMarkerSetLabel.setPreferredSize(markerLabelSize);
-            activeMarkerSetLabel.setMaximumSize(markerLabelSize);
-            tools.add(activeMarkerSetLabel);
-            tools.add(Box.createVerticalStrut(8));
-
-            addSection(tools, "Image");
-            tools.add(button("Open Gel Image...", "open_image"));
             tools.add(Box.createVerticalStrut(8));
 
             addSection(tools, "Crop");
@@ -188,8 +277,9 @@ public class WBToolJava implements Command {
             addSection(tools, "Figure");
             tools.add(button("Wider", "wider"));
             tools.add(button("Narrower", "narrower"));
-            tools.add(button("Show Coordinate Log", "show_coordinate_log"));
-            tools.add(button("Reconstruct from Log...", "reconstruct_from_log"));
+            tools.add(button("Edit Selected Coordinates...", "edit_coordinates"));
+            tools.add(button("View Coordinate Log", "view_current_log"));
+            tools.add(button("Copy Coordinate Log", "copy_current_log"));
             tools.add(button("Clear Figure", "clear_figure"));
             tools.add(Box.createVerticalStrut(8));
 
@@ -201,14 +291,28 @@ public class WBToolJava implements Command {
             JScrollPane scrollPane = new JScrollPane(figureCanvas);
             scrollPane.setPreferredSize(new Dimension(FIG_INIT_W, 620));
 
-            statusLabel = new JLabel(" ");
-            statusLabel.setBorder(BorderFactory.createEmptyBorder(0, 10, 8, 10));
+            JPanel titleBar = new JPanel(new BorderLayout(8, 0));
+            titleBar.setBorder(BorderFactory.createEmptyBorder(10, 10, 0, 10));
+            titleBar.add(new JLabel("Figure name:"), BorderLayout.WEST);
+            figureTitleField = new JTextField("Untitled figure");
+            figureTitleField.addActionListener(new ActionListener() {
+                @Override
+                public void actionPerformed(ActionEvent event) {
+                    saveProject(true);
+                }
+            });
+            figureTitleField.addFocusListener(new FocusAdapter() {
+                @Override
+                public void focusLost(FocusEvent event) {
+                    saveProject(false);
+                }
+            });
+            titleBar.add(figureTitleField, BorderLayout.CENTER);
 
-            frame.add(tools, BorderLayout.WEST);
-            frame.add(scrollPane, BorderLayout.CENTER);
-            frame.add(statusLabel, BorderLayout.SOUTH);
-            frame.pack();
-            placeFrameLeftHalf();
+            editor.add(titleBar, BorderLayout.NORTH);
+            editor.add(tools, BorderLayout.WEST);
+            editor.add(scrollPane, BorderLayout.CENTER);
+            return editor;
         }
 
         private void placeFrameLeftHalf() {
@@ -239,7 +343,22 @@ public class WBToolJava implements Command {
         @Override
         public void actionPerformed(ActionEvent event) {
             String command = event.getActionCommand();
-            if ("open_image".equals(command)) {
+            if ("new_figure".equals(command)) {
+                newFigure();
+            } else if ("home".equals(command)) {
+                saveProject(false);
+                showHome();
+            } else if ("open_history".equals(command)) {
+                openSelectedHistoryFigure();
+            } else if ("view_log".equals(command)) {
+                viewSelectedHistoryLog();
+            } else if ("copy_log".equals(command)) {
+                copySelectedHistoryLog();
+            } else if ("delete_history".equals(command)) {
+                deleteSelectedHistoryFigure();
+            } else if ("refresh_history".equals(command)) {
+                refreshHistory();
+            } else if ("open_image".equals(command)) {
                 openImage();
             } else if ("open_marker_image".equals(command)) {
                 openMarkerImage();
@@ -257,10 +376,12 @@ public class WBToolJava implements Command {
                 resizeSelectedBand(1.12);
             } else if ("narrower".equals(command)) {
                 resizeSelectedBand(1.0 / 1.12);
-            } else if ("show_coordinate_log".equals(command)) {
-                showCoordinateLog();
-            } else if ("reconstruct_from_log".equals(command)) {
-                showReconstructionLogDialog();
+            } else if ("edit_coordinates".equals(command)) {
+                editSelectedCoordinates();
+            } else if ("view_current_log".equals(command)) {
+                showCoordinateLog(coordinateLog(), figureTitle() + " - Coordinate Log");
+            } else if ("copy_current_log".equals(command)) {
+                copyText(coordinateLog(), "Coordinate log copied to the clipboard.");
             } else if ("clear_figure".equals(command)) {
                 clearFigure();
             } else if ("export_pdf".equals(command)) {
@@ -268,57 +389,578 @@ public class WBToolJava implements Command {
             }
         }
 
+        private void newFigure() {
+            saveProject(false);
+            cancelCropMode();
+            if (kdaModeActive) {
+                deactivateKdaMode();
+            }
+            bands.clear();
+            kdaMarkers.clear();
+            selectedBand = null;
+            gelImp = null;
+            markerImp = null;
+            gelImagePath = "";
+            markerImagePath = "";
+            projectId = UUID.randomUUID().toString();
+            projectCreatedAt = System.currentTimeMillis();
+            figureTitleField.setText("Untitled figure");
+            figureCanvas.refreshLayout();
+            cards.show(cardPanel, CARD_EDITOR);
+            frame.setTitle("GelAnno - Untitled figure");
+            saveProject(false);
+            setStatus("New figure created. Changes are saved automatically.");
+        }
+
+        private void showHome() {
+            refreshHistory();
+            cards.show(cardPanel, CARD_HOME);
+            frame.setTitle("GelAnno");
+            setStatus("Select a recent figure, or create a blank figure.");
+        }
+
+        private File historyRoot() {
+            String configured = Prefs.get("gelanno.history_dir", null);
+            File root;
+            if (configured != null && configured.trim().length() > 0) {
+                root = new File(configured);
+            } else {
+                String preferences = IJ.getDirectory("preferences");
+                if (preferences == null) {
+                    preferences = System.getProperty("user.home", ".");
+                }
+                root = new File(preferences, "GelAnno/figure-history");
+                Prefs.set("gelanno.history_dir", root.getAbsolutePath());
+            }
+            if (!root.exists()) {
+                root.mkdirs();
+            }
+            return root;
+        }
+
+        private void refreshHistory() {
+            if (historyModel == null) {
+                return;
+            }
+            historyRecords.clear();
+            File[] directories = historyRoot().listFiles();
+            if (directories != null) {
+                for (File directory : directories) {
+                    if (!directory.isDirectory()) {
+                        continue;
+                    }
+                    Properties properties = readProperties(new File(directory, "project.properties"));
+                    if (properties == null) {
+                        continue;
+                    }
+                    historyRecords.add(new FigureRecord(
+                            directory,
+                            properties.getProperty("title", "Untitled figure"),
+                            longValue(properties, "modifiedAt", directory.lastModified()),
+                            intValue(properties, "crop.count", 0)));
+                }
+            }
+            Collections.sort(historyRecords, new Comparator<FigureRecord>() {
+                @Override
+                public int compare(FigureRecord left, FigureRecord right) {
+                    return Long.compare(right.modifiedAt, left.modifiedAt);
+                }
+            });
+            historyModel.setRowCount(0);
+            DateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd  HH:mm");
+            for (FigureRecord record : historyRecords) {
+                historyModel.addRow(new Object[] {
+                    record.title,
+                    dateFormat.format(new Date(record.modifiedAt)),
+                    Integer.valueOf(record.cropCount)
+                });
+            }
+            if (!historyRecords.isEmpty()) {
+                historyTable.setRowSelectionInterval(0, 0);
+            }
+        }
+
+        private FigureRecord selectedHistoryRecord() {
+            int row = historyTable == null ? -1 : historyTable.getSelectedRow();
+            if (row < 0 || row >= historyRecords.size()) {
+                JOptionPane.showMessageDialog(frame, "Select a figure from the recent list first.",
+                        "GelAnno", JOptionPane.INFORMATION_MESSAGE);
+                return null;
+            }
+            return historyRecords.get(row);
+        }
+
+        private void openSelectedHistoryFigure() {
+            FigureRecord record = selectedHistoryRecord();
+            if (record == null) {
+                return;
+            }
+            if (!loadProject(record.directory)) {
+                JOptionPane.showMessageDialog(frame, "This saved figure could not be opened.",
+                        "GelAnno", JOptionPane.ERROR_MESSAGE);
+                return;
+            }
+            cards.show(cardPanel, CARD_EDITOR);
+            frame.setTitle("GelAnno - " + figureTitle());
+            setStatus("Saved figure opened. Changes are saved automatically.");
+        }
+
+        private void viewSelectedHistoryLog() {
+            FigureRecord record = selectedHistoryRecord();
+            if (record == null) {
+                return;
+            }
+            Properties properties = readProperties(new File(record.directory, "project.properties"));
+            if (properties != null) {
+                showCoordinateLog(coordinateLog(properties), record.title + " - Coordinate Log");
+            }
+        }
+
+        private void copySelectedHistoryLog() {
+            FigureRecord record = selectedHistoryRecord();
+            if (record == null) {
+                return;
+            }
+            Properties properties = readProperties(new File(record.directory, "project.properties"));
+            if (properties != null) {
+                copyText(coordinateLog(properties), "Coordinate log copied to the clipboard.");
+            }
+        }
+
+        private void deleteSelectedHistoryFigure() {
+            FigureRecord record = selectedHistoryRecord();
+            if (record == null) {
+                return;
+            }
+            int answer = JOptionPane.showConfirmDialog(frame,
+                    "Delete \"" + record.title + "\" and its saved crops?\n"
+                            + "This cannot be undone.",
+                    "Delete past figure", JOptionPane.YES_NO_OPTION,
+                    JOptionPane.WARNING_MESSAGE);
+            if (answer != JOptionPane.YES_OPTION) {
+                return;
+            }
+            try {
+                File root = historyRoot().getCanonicalFile();
+                File target = record.directory.getCanonicalFile();
+                File parent = target.getParentFile();
+                if (parent == null || !parent.equals(root)) {
+                    throw new IOException("The selected folder is outside GelAnno history.");
+                }
+                if (!deleteRecursively(target)) {
+                    throw new IOException("One or more saved files could not be removed.");
+                }
+                if (target.getName().equals(projectId)) {
+                    projectId = null;
+                    bands.clear();
+                    kdaMarkers.clear();
+                    selectedBand = null;
+                    figureCanvas.refreshLayout();
+                }
+                refreshHistory();
+                setStatus("Past figure deleted from GelAnno history.");
+            } catch (IOException ex) {
+                JOptionPane.showMessageDialog(frame,
+                        "Could not delete the selected figure.\n" + ex.getMessage(),
+                        "Delete past figure", JOptionPane.ERROR_MESSAGE);
+            }
+        }
+
+        private boolean deleteRecursively(File file) {
+            if (file.isDirectory() && !Files.isSymbolicLink(file.toPath())) {
+                File[] children = file.listFiles();
+                if (children == null) {
+                    return false;
+                }
+                for (File child : children) {
+                    if (!deleteRecursively(child)) {
+                        return false;
+                    }
+                }
+            }
+            return file.delete();
+        }
+
+        private void showCoordinateLog(String text, String title) {
+            JTextArea area = new JTextArea(text, 24, 74);
+            area.setEditable(false);
+            area.setCaretPosition(0);
+            area.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+            JOptionPane.showMessageDialog(frame, new JScrollPane(area), title,
+                    JOptionPane.INFORMATION_MESSAGE);
+        }
+
+        private void copyText(String text, String message) {
+            Toolkit.getDefaultToolkit().getSystemClipboard().setContents(
+                    new StringSelection(text == null ? "" : text), null);
+            setStatus(message);
+        }
+
+        private String figureTitle() {
+            if (figureTitleField == null || figureTitleField.getText().trim().length() == 0) {
+                return "Untitled figure";
+            }
+            return figureTitleField.getText().trim();
+        }
+
+        private boolean saveProject(boolean announce) {
+            if (projectId == null || figureTitleField == null) {
+                return true;
+            }
+            File directory = new File(historyRoot(), projectId);
+            if (!directory.exists() && !directory.mkdirs()) {
+                if (announce) {
+                    setStatus("Could not create the GelAnno history folder.");
+                }
+                return false;
+            }
+            Properties properties = new Properties();
+            long now = System.currentTimeMillis();
+            properties.setProperty("format.version", "1");
+            properties.setProperty("id", projectId);
+            properties.setProperty("title", figureTitle());
+            properties.setProperty("createdAt", Long.toString(projectCreatedAt));
+            properties.setProperty("modifiedAt", Long.toString(now));
+            properties.setProperty("gel.path", gelImagePath == null ? "" : gelImagePath);
+            properties.setProperty("marker.path", markerImagePath == null ? "" : markerImagePath);
+            properties.setProperty("marker.count", Integer.toString(kdaMarkers.size()));
+            for (int i = 0; i < kdaMarkers.size(); i++) {
+                KdaMarker marker = kdaMarkers.get(i);
+                String key = "marker." + i + ".";
+                properties.setProperty(key + "label", marker.label);
+                properties.setProperty(key + "x", Double.toString(marker.xAbs));
+                properties.setProperty(key + "y", Double.toString(marker.yAbs));
+            }
+            properties.setProperty("crop.count", Integer.toString(bands.size()));
+            try {
+                for (int i = 0; i < bands.size(); i++) {
+                    BandCrop band = bands.get(i);
+                    String key = "crop." + i + ".";
+                    String imageName = String.format("crop-%03d.png", Integer.valueOf(i + 1));
+                    properties.setProperty(key + "image", imageName);
+                    properties.setProperty(key + "label", band.label);
+                    properties.setProperty(key + "displayWidth", Integer.toString(band.displayWidth));
+                    properties.setProperty(key + "xOffset", Double.toString(band.xOffset));
+                    properties.setProperty(key + "yOffset", Double.toString(band.yOffset));
+                    properties.setProperty(key + "x", Double.toString(band.cropX));
+                    properties.setProperty(key + "y", Double.toString(band.cropY));
+                    properties.setProperty(key + "width", Integer.toString(band.cropWidth));
+                    properties.setProperty(key + "height", Integer.toString(band.cropHeight));
+                    properties.setProperty(key + "angle", Double.toString(band.cropAngleDeg));
+                    properties.setProperty(key + "marker.count", Integer.toString(band.markers.size()));
+                    for (int m = 0; m < band.markers.size(); m++) {
+                        CropMarker marker = band.markers.get(m);
+                        String markerKey = key + "marker." + m + ".";
+                        properties.setProperty(markerKey + "label", marker.label);
+                        properties.setProperty(markerKey + "cropY", Double.toString(marker.yInCrop));
+                        properties.setProperty(markerKey + "x", Double.toString(marker.xAbs));
+                        properties.setProperty(markerKey + "y", Double.toString(marker.yAbs));
+                    }
+                    ImageIO.write(band.image, "png", new File(directory, imageName));
+                }
+                BufferedOutputStream output = new BufferedOutputStream(
+                        new FileOutputStream(new File(directory, "project.properties")));
+                try {
+                    properties.store(output, "GelAnno figure history");
+                } finally {
+                    output.close();
+                }
+                if (announce) {
+                    setStatus("Figure saved to GelAnno history.");
+                }
+                frame.setTitle("GelAnno - " + figureTitle());
+                return true;
+            } catch (IOException ex) {
+                if (announce) {
+                    JOptionPane.showMessageDialog(frame, "Could not save the figure history.\n" + ex.getMessage(),
+                            "GelAnno", JOptionPane.ERROR_MESSAGE);
+                }
+                return false;
+            }
+        }
+
+        private boolean loadProject(File directory) {
+            Properties properties = readProperties(new File(directory, "project.properties"));
+            if (properties == null) {
+                return false;
+            }
+            cancelCropMode();
+            if (kdaModeActive) {
+                deactivateKdaMode();
+            }
+            bands.clear();
+            kdaMarkers.clear();
+            selectedBand = null;
+            gelImp = null;
+            markerImp = null;
+            projectId = properties.getProperty("id", directory.getName());
+            projectCreatedAt = longValue(properties, "createdAt", directory.lastModified());
+            gelImagePath = properties.getProperty("gel.path", "");
+            markerImagePath = properties.getProperty("marker.path", "");
+            figureTitleField.setText(properties.getProperty("title", "Untitled figure"));
+
+            int markerCount = intValue(properties, "marker.count", 0);
+            for (int i = 0; i < markerCount; i++) {
+                String key = "marker." + i + ".";
+                kdaMarkers.add(new KdaMarker(
+                        doubleValue(properties, key + "x", 0.0),
+                        doubleValue(properties, key + "y", 0.0),
+                        properties.getProperty(key + "label", "")));
+            }
+            int cropCount = intValue(properties, "crop.count", 0);
+            try {
+                for (int i = 0; i < cropCount; i++) {
+                    String key = "crop." + i + ".";
+                    BufferedImage image = ImageIO.read(new File(directory,
+                            properties.getProperty(key + "image", String.format(
+                                    "crop-%03d.png", Integer.valueOf(i + 1)))));
+                    if (image == null) {
+                        return false;
+                    }
+                    List<CropMarker> markers = new ArrayList<CropMarker>();
+                    int localMarkerCount = intValue(properties, key + "marker.count", 0);
+                    for (int m = 0; m < localMarkerCount; m++) {
+                        String markerKey = key + "marker." + m + ".";
+                        markers.add(new CropMarker(
+                                properties.getProperty(markerKey + "label", ""),
+                                doubleValue(properties, markerKey + "cropY", 0.0),
+                                doubleValue(properties, markerKey + "x", 0.0),
+                                doubleValue(properties, markerKey + "y", 0.0)));
+                    }
+                    BandCrop band = new BandCrop(image, markers,
+                            properties.getProperty(key + "label", "Protein"),
+                            intValue(properties, key + "displayWidth", image.getWidth()));
+                    band.xOffset = doubleValue(properties, key + "xOffset", 0.0);
+                    band.yOffset = doubleValue(properties, key + "yOffset", 0.0);
+                    band.cropX = doubleValue(properties, key + "x", 0.0);
+                    band.cropY = doubleValue(properties, key + "y", 0.0);
+                    band.cropWidth = intValue(properties, key + "width", image.getWidth());
+                    band.cropHeight = intValue(properties, key + "height", image.getHeight());
+                    band.cropAngleDeg = doubleValue(properties, key + "angle", 0.0);
+                    bands.add(band);
+                }
+            } catch (IOException ex) {
+                return false;
+            }
+            if (!bands.isEmpty()) {
+                selectedBand = bands.get(0);
+            }
+            figureCanvas.refreshLayout();
+            return true;
+        }
+
+        private Properties readProperties(File file) {
+            if (!file.isFile()) {
+                return null;
+            }
+            Properties properties = new Properties();
+            try {
+                BufferedInputStream input = new BufferedInputStream(new FileInputStream(file));
+                try {
+                    properties.load(input);
+                } finally {
+                    input.close();
+                }
+                return properties;
+            } catch (IOException ex) {
+                return null;
+            }
+        }
+
+        private static int intValue(Properties properties, String key, int fallback) {
+            try {
+                return Integer.parseInt(properties.getProperty(key, Integer.toString(fallback)));
+            } catch (NumberFormatException ex) {
+                return fallback;
+            }
+        }
+
+        private static long longValue(Properties properties, String key, long fallback) {
+            try {
+                return Long.parseLong(properties.getProperty(key, Long.toString(fallback)));
+            } catch (NumberFormatException ex) {
+                return fallback;
+            }
+        }
+
+        private static double doubleValue(Properties properties, String key, double fallback) {
+            try {
+                return Double.parseDouble(properties.getProperty(key, Double.toString(fallback)));
+            } catch (NumberFormatException ex) {
+                return fallback;
+            }
+        }
+
+        private String coordinateLog() {
+            StringBuilder log = new StringBuilder();
+            log.append("GelAnno Coordinate Log\n");
+            log.append("Figure: ").append(figureTitle()).append('\n');
+            if (gelImagePath != null && gelImagePath.length() > 0) {
+                log.append("Gel image: ").append(gelImagePath).append('\n');
+            }
+            log.append("Crops: ").append(bands.size()).append("\n\n");
+            for (int i = 0; i < bands.size(); i++) {
+                appendBandLog(log, i, bands.get(i));
+            }
+            return log.toString();
+        }
+
+        private String coordinateLog(Properties properties) {
+            StringBuilder log = new StringBuilder();
+            log.append("GelAnno Coordinate Log\n");
+            log.append("Figure: ").append(properties.getProperty("title", "Untitled figure")).append('\n');
+            String gelPath = properties.getProperty("gel.path", "");
+            if (gelPath.length() > 0) {
+                log.append("Gel image: ").append(gelPath).append('\n');
+            }
+            int cropCount = intValue(properties, "crop.count", 0);
+            log.append("Crops: ").append(cropCount).append("\n\n");
+            for (int i = 0; i < cropCount; i++) {
+                String key = "crop." + i + ".";
+                log.append("Crop ").append(i + 1).append(": ")
+                        .append(properties.getProperty(key + "label", "Protein")).append('\n');
+                log.append("  x=").append(formatCoordinate(doubleValue(properties, key + "x", 0.0)))
+                        .append(", y=").append(formatCoordinate(doubleValue(properties, key + "y", 0.0)))
+                        .append(", width=").append(intValue(properties, key + "width", 0))
+                        .append(", height=").append(intValue(properties, key + "height", 0))
+                        .append(", angle=").append(formatCoordinate(
+                                doubleValue(properties, key + "angle", 0.0))).append(" deg\n");
+                int markerCount = intValue(properties, key + "marker.count", 0);
+                for (int m = 0; m < markerCount; m++) {
+                    String markerKey = key + "marker." + m + ".";
+                    log.append("  marker ").append(properties.getProperty(markerKey + "label", ""))
+                            .append(": x=").append(formatCoordinate(
+                                    doubleValue(properties, markerKey + "x", 0.0)))
+                            .append(", y=").append(formatCoordinate(
+                                    doubleValue(properties, markerKey + "y", 0.0)))
+                            .append(", cropY=").append(formatCoordinate(
+                                    doubleValue(properties, markerKey + "cropY", 0.0))).append('\n');
+                }
+                log.append('\n');
+            }
+            return log.toString();
+        }
+
+        private void appendBandLog(StringBuilder log, int index, BandCrop band) {
+            log.append("Crop ").append(index + 1).append(": ").append(band.label).append('\n');
+            log.append("  x=").append(formatCoordinate(band.cropX))
+                    .append(", y=").append(formatCoordinate(band.cropY))
+                    .append(", width=").append(band.cropWidth)
+                    .append(", height=").append(band.cropHeight)
+                    .append(", angle=").append(formatCoordinate(band.cropAngleDeg)).append(" deg\n");
+            for (CropMarker marker : band.markers) {
+                log.append("  marker ").append(marker.label)
+                        .append(": x=").append(formatCoordinate(marker.xAbs))
+                        .append(", y=").append(formatCoordinate(marker.yAbs))
+                        .append(", cropY=").append(formatCoordinate(marker.yInCrop)).append('\n');
+            }
+            log.append('\n');
+        }
+
+        private static String formatCoordinate(double value) {
+            return String.format(Locale.US, "%.2f", Double.valueOf(value));
+        }
+
+        private void editSelectedCoordinates() {
+            if (selectedBand == null) {
+                JOptionPane.showMessageDialog(frame, "Select a crop in the figure first.",
+                        "Edit coordinates", JOptionPane.INFORMATION_MESSAGE);
+                return;
+            }
+            final BandCrop band = selectedBand;
+            JTextField label = new JTextField(band.label);
+            JTextField x = new JTextField(Double.toString(band.cropX));
+            JTextField y = new JTextField(Double.toString(band.cropY));
+            JTextField width = new JTextField(Integer.toString(band.cropWidth));
+            JTextField height = new JTextField(Integer.toString(band.cropHeight));
+            JTextField angle = new JTextField(Double.toString(band.cropAngleDeg));
+            JPanel fields = new JPanel(new GridLayout(0, 2, 8, 6));
+            fields.add(new JLabel("Crop label"));
+            fields.add(label);
+            fields.add(new JLabel("Source X"));
+            fields.add(x);
+            fields.add(new JLabel("Source Y"));
+            fields.add(y);
+            fields.add(new JLabel("Source width"));
+            fields.add(width);
+            fields.add(new JLabel("Source height"));
+            fields.add(height);
+            fields.add(new JLabel("Rotation angle (degrees)"));
+            fields.add(angle);
+            int result = JOptionPane.showConfirmDialog(frame, fields,
+                    "Edit selected crop coordinates", JOptionPane.OK_CANCEL_OPTION,
+                    JOptionPane.PLAIN_MESSAGE);
+            if (result != JOptionPane.OK_OPTION) {
+                return;
+            }
+            try {
+                double newX = Double.parseDouble(x.getText().trim());
+                double newY = Double.parseDouble(y.getText().trim());
+                int newWidth = Integer.parseInt(width.getText().trim());
+                int newHeight = Integer.parseInt(height.getText().trim());
+                double newAngle = Double.parseDouble(angle.getText().trim());
+                if (newWidth < 1 || newHeight < 1) {
+                    throw new NumberFormatException("Width and height must be positive.");
+                }
+                band.label = label.getText().trim().length() == 0 ? "Protein" : label.getText().trim();
+                band.cropX = newX;
+                band.cropY = newY;
+                band.cropWidth = newWidth;
+                band.cropHeight = newHeight;
+                band.cropAngleDeg = newAngle;
+                figureCanvas.repaint();
+                saveProject(false);
+                setStatus("Crop coordinates updated and saved.");
+            } catch (NumberFormatException ex) {
+                JOptionPane.showMessageDialog(frame,
+                        "Enter numeric values for X, Y, width, height, and angle.",
+                        "Invalid coordinates", JOptionPane.WARNING_MESSAGE);
+            }
+        }
+
         private void openImage() {
-            LoadedImage loaded = openRgbImage();
-            if (loaded == null) {
+            ImagePlus imp = openRgbImage();
+            if (imp == null) {
                 return;
             }
             cancelCropMode();
             if (kdaModeActive) {
                 deactivateKdaMode();
             }
-            clearOverlay(gelImp);
-            gelImp = loaded.imagePlus;
-            gelPath = loaded.path;
-            markingSourceType = MarkerSourceType.GEL_IMAGE;
-            startFreshMarkerSetOnNextMark = true;
-            if (activeMarkerSet != null
-                    && activeMarkerSet.sourceType != MarkerSourceType.MARKER_IMAGE) {
-                activeMarkerSet = null;
+            if (markerImp == null) {
+                clearOverlay(gelImp);
             }
-            showImageRightHalf(gelImp);
-            warnAboutMarkerMapping(activeMarkerSet);
-            redrawKdaOverlays();
+            gelImp = imp;
+            gelImagePath = openedImagePath;
+            if (markerImp == null) {
+                kdaMarkers.clear();
+            }
+            showImageRightHalf(imp);
             activateGelImage();
             setCropSelectionTool();
-            updateActiveMarkerSetLabel();
-            setStatus(activeMarkerSet == null
-                    ? "Gel loaded. Click Mark kDa Bands to start a new marker set on this Gel."
-                    : "Gel loaded. " + activeMarkerSet.id
-                            + " from the kDa marker image is applied. Click Mark to start "
-                            + "a new set directly on this Gel.");
+            setStatus(markerImp == null
+                    ? "Gel loaded. Mark kDa bands on it, or open a separate kDa marker image."
+                    : "Gel loaded. Existing markers from the kDa marker image will be applied to crops.");
+            saveProject(false);
         }
 
         private void openMarkerImage() {
-            LoadedImage loaded = openRgbImage();
-            if (loaded == null) {
+            ImagePlus imp = openRgbImage();
+            if (imp == null) {
                 return;
             }
             cancelCropMode();
             if (kdaModeActive) {
                 deactivateKdaMode();
             }
-            clearOverlay(markerImp);
-            markerImp = loaded.imagePlus;
-            markerPath = loaded.path;
-            markingSourceType = MarkerSourceType.MARKER_IMAGE;
-            startFreshMarkerSetOnNextMark = true;
-            activeMarkerSet = null;
-            showImageRightHalf(markerImp);
-            redrawKdaOverlays();
+            clearOverlay(kdaSourceImage());
+            markerImp = imp;
+            markerImagePath = openedImagePath;
+            kdaMarkers.clear();
+            showImageRightHalf(imp);
             setCropSelectionTool();
-            updateActiveMarkerSetLabel();
             setStatus("kDa marker image loaded. Click Mark kDa Bands, then click its marker bands.");
+            saveProject(false);
         }
 
         private void cancelCropMode() {
@@ -330,7 +972,7 @@ public class WBToolJava implements Command {
             }
         }
 
-        private LoadedImage openRgbImage() {
+        private ImagePlus openRgbImage() {
             JFileChooser chooser = new JFileChooser();
             chooser.setFileFilter(new FileNameExtensionFilter(
                     "Image files (TIFF, PNG, JPEG)", "tif", "tiff", "png", "jpg", "jpeg"));
@@ -346,6 +988,7 @@ public class WBToolJava implements Command {
                 return null;
             }
             File chosen = chooser.getSelectedFile();
+            openedImagePath = chosen.getAbsolutePath();
             lastDir = chosen.getParentFile();
             if (lastDir != null) {
                 Prefs.set("wbtool.last_dir", lastDir.getAbsolutePath());
@@ -359,13 +1002,7 @@ public class WBToolJava implements Command {
             if (imp.getType() != ImagePlus.COLOR_RGB) {
                 new ImageConverter(imp).convertToRGB();
             }
-            String path;
-            try {
-                path = chosen.getCanonicalPath();
-            } catch (Exception ignored) {
-                path = chosen.getAbsolutePath();
-            }
-            return new LoadedImage(imp, path);
+            return imp;
         }
 
         private void showImageRightHalf(ImagePlus imp) {
@@ -378,7 +1015,7 @@ public class WBToolJava implements Command {
         }
 
         private void toggleMarkKda() {
-            if (markingSourceImage() == null) {
+            if (kdaSourceImage() == null) {
                 JOptionPane.showMessageDialog(frame, "Open a gel image or a kDa marker image first.",
                         "No image", JOptionPane.WARNING_MESSAGE);
                 return;
@@ -391,28 +1028,22 @@ public class WBToolJava implements Command {
         }
 
         private void activateKdaMode() {
-            final ImagePlus source = markingSourceImage();
+            final ImagePlus source = kdaSourceImage();
             if (source == null || source.getCanvas() == null) {
                 return;
-            }
-            if (startFreshMarkerSetOnNextMark
-                    || activeMarkerSet == null
-                    || !activeMarkerSet.matchesSource(
-                            markingSourceType, markingSourcePath(), source.getWidth(), source.getHeight())) {
-                activeMarkerSet = createMarkerSetForCurrentSource();
-                startFreshMarkerSetOnNextMark = false;
-                warnAboutMarkerMapping(activeMarkerSet);
-                redrawKdaOverlays();
-                updateActiveMarkerSetLabel();
             }
             kdaModeActive = true;
             markButton.setText("Stop Marking kDa");
             markButton.setBackground(new Color(255, 180, 0));
-            setStatus("kDa marking active on the " + markingSourceType.displayName
-                    + ". Current set: " + activeMarkerSet.id + ".");
+            setStatus(markerImp == null
+                    ? "kDa marking active. Click a marker band in the gel image."
+                    : "kDa marking active. Click a marker band in the separate marker image.");
             IJ.setTool("point");
 
             final ImageCanvas canvas = source.getCanvas();
+            // ImageJ treats a press held while our label dialog is open as a long click
+            // and shows its canvas context menu. Disable that menu only while marking.
+            canvas.disablePopupMenu(true);
             gelMouseListener = new MouseAdapter() {
                 @Override
                 public void mousePressed(MouseEvent event) {
@@ -436,6 +1067,9 @@ public class WBToolJava implements Command {
             if (kdaCanvas != null && gelMouseListener != null) {
                 kdaCanvas.removeMouseListener(gelMouseListener);
             }
+            if (kdaCanvas != null) {
+                kdaCanvas.disablePopupMenu(false);
+            }
             gelMouseListener = null;
             kdaCanvas = null;
             setCropSelectionTool();
@@ -454,65 +1088,40 @@ public class WBToolJava implements Command {
                         "Invalid kDa", JOptionPane.WARNING_MESSAGE);
                 return;
             }
-            KdaMarkerSet markerSet = editableMarkerSetForCurrentSource();
-            startFreshMarkerSetOnNextMark = false;
-            markerSet.markers.add(new KdaMarker(x, y, value));
-            warnAboutMarkerMapping(markerSet);
-            redrawKdaOverlays();
-            updateActiveMarkerSetLabel();
-            setStatus("kDa marking active. " + markerSet.markers.size()
-                    + " marker(s) saved in " + markerSet.id + ".");
+            kdaMarkers.add(new KdaMarker(x, y, value));
+            Collections.sort(kdaMarkers, new Comparator<KdaMarker>() {
+                @Override
+                public int compare(KdaMarker a, KdaMarker b) {
+                    return Double.compare(a.yAbs, b.yAbs);
+                }
+            });
+            redrawKdaOverlay();
+            saveProject(false);
+            setStatus("kDa marking active. " + kdaMarkers.size() + " marker(s) saved.");
         }
 
         private void toggleSourceKdaLabels() {
             showSourceKdaLabels = !showSourceKdaLabels;
             sourceKdaLabelsButton.setText(showSourceKdaLabels ? "Hide kDa Labels" : "Show kDa Labels");
-            redrawKdaOverlays();
-            redrawAnnotatedMarkerImages();
+            redrawKdaOverlay();
             setStatus(showSourceKdaLabels
-                    ? "kDa labels are visible on the loaded images."
-                    : "kDa labels are hidden on the loaded images; marker Xs remain visible.");
+                    ? "kDa labels are visible on the source image."
+                    : "kDa labels are hidden on the source image; marker Xs remain visible.");
         }
 
-        private void redrawKdaOverlays() {
-            clearOverlay(markerImp);
-            clearOverlay(gelImp);
-            if (activeMarkerSet == null || activeMarkerSet.markers.isEmpty()) {
+        private void redrawKdaOverlay() {
+            ImagePlus source = kdaSourceImage();
+            if (source == null) {
                 return;
             }
-            if (activeMarkerSet.sourceType == MarkerSourceType.MARKER_IMAGE) {
-                if (markerImp != null && samePath(markerPath, activeMarkerSet.sourcePath)) {
-                    drawKdaOverlay(markerImp, activeMarkerSet, false);
-                }
-                if (gelImp != null) {
-                    drawKdaOverlay(gelImp, activeMarkerSet, true);
-                }
-            } else if (gelImp != null && samePath(gelPath, activeMarkerSet.sourcePath)) {
-                drawKdaOverlay(gelImp, activeMarkerSet, false);
-            }
-        }
-
-        private void drawKdaOverlay(ImagePlus image, KdaMarkerSet markerSet,
-                boolean useGelCoordinates) {
-            double scaleX = 1.0;
-            double scaleY = 1.0;
-            if (useGelCoordinates && gelImp != null) {
-                scaleX = gelImp.getWidth() / (double) markerSet.sourceWidth;
-                scaleY = gelImp.getHeight() / (double) markerSet.sourceHeight;
-            }
-            drawKdaOverlay(image, markerSet, scaleX, scaleY);
-        }
-
-        private void drawKdaOverlay(ImagePlus image, KdaMarkerSet markerSet,
-                double scaleX, double scaleY) {
-            if (image == null || markerSet == null || markerSet.markers.isEmpty()) {
-                clearOverlay(image);
+            if (kdaMarkers.isEmpty()) {
+                clearOverlay(source);
                 return;
             }
             Overlay overlay = new Overlay();
-            for (KdaMarker marker : markerSet.markers) {
-                double x = marker.xAbs * scaleX;
-                double y = marker.yAbs * scaleY;
+            for (KdaMarker marker : kdaMarkers) {
+                double x = marker.xAbs;
+                double y = marker.yAbs;
                 Line diagA = new Line(x - SOURCE_MARKER_R, y - SOURCE_MARKER_R,
                         x + SOURCE_MARKER_R, y + SOURCE_MARKER_R);
                 diagA.setStrokeColor(Color.RED);
@@ -530,70 +1139,12 @@ public class WBToolJava implements Command {
                     overlay.add(label);
                 }
             }
-            image.setOverlay(overlay);
-            image.updateAndDraw();
+            source.setOverlay(overlay);
+            source.updateAndDraw();
         }
 
-        private void redrawAnnotatedMarkerImages() {
-            for (AnnotatedMarkerImage annotated : annotatedMarkerImages) {
-                drawKdaOverlay(annotated.imagePlus, annotated.markerSet,
-                        annotated.scaleX, annotated.scaleY);
-            }
-        }
-
-        private ImagePlus markingSourceImage() {
-            if (markingSourceType == MarkerSourceType.MARKER_IMAGE) {
-                return markerImp;
-            }
-            if (markingSourceType == MarkerSourceType.GEL_IMAGE) {
-                return gelImp;
-            }
+        private ImagePlus kdaSourceImage() {
             return markerImp != null ? markerImp : gelImp;
-        }
-
-        private String markingSourcePath() {
-            return markingSourceType == MarkerSourceType.MARKER_IMAGE ? markerPath : gelPath;
-        }
-
-        private KdaMarkerSet createMarkerSetForCurrentSource() {
-            ImagePlus source = markingSourceImage();
-            if (source == null || markingSourceType == null) {
-                return null;
-            }
-            KdaMarkerSet markerSet = new KdaMarkerSet(nextMarkerSetId(), markingSourceType,
-                    markingSourcePath(), source.getWidth(), source.getHeight());
-            markerSets.add(markerSet);
-            return markerSet;
-        }
-
-        private KdaMarkerSet editableMarkerSetForCurrentSource() {
-            ImagePlus source = markingSourceImage();
-            if (activeMarkerSet == null
-                    || !activeMarkerSet.matchesSource(markingSourceType, markingSourcePath(),
-                            source.getWidth(), source.getHeight())) {
-                activeMarkerSet = createMarkerSetForCurrentSource();
-                startFreshMarkerSetOnNextMark = false;
-            } else if (activeMarkerSet.frozen) {
-                KdaMarkerSet copy = activeMarkerSet.editableCopy(nextMarkerSetId());
-                markerSets.add(copy);
-                activeMarkerSet = copy;
-            }
-            return activeMarkerSet;
-        }
-
-        private String nextMarkerSetId() {
-            return String.format(Locale.US, "KDA-%03d", Integer.valueOf(nextMarkerSetNumber++));
-        }
-
-        private void updateActiveMarkerSetLabel() {
-            if (activeMarkerSet == null) {
-                activeMarkerSetLabel.setText("Active markers: none");
-                activeMarkerSetLabel.setToolTipText(null);
-                return;
-            }
-            activeMarkerSetLabel.setText("Active: " + activeMarkerSet.id
-                    + " (" + activeMarkerSet.sourceType.shortName + ")");
-            activeMarkerSetLabel.setToolTipText(activeMarkerSet.sourcePath);
         }
 
         private void clearOverlay(ImagePlus imp) {
@@ -604,30 +1155,19 @@ public class WBToolJava implements Command {
         }
 
         private void undoLastKda() {
-            if (activeMarkerSet == null || activeMarkerSet.markers.isEmpty()) {
-                return;
+            if (!kdaMarkers.isEmpty()) {
+                kdaMarkers.remove(kdaMarkers.size() - 1);
+                redrawKdaOverlay();
+                saveProject(false);
             }
-            if (activeMarkerSet.frozen) {
-                KdaMarkerSet copy = activeMarkerSet.editableCopy(nextMarkerSetId());
-                markerSets.add(copy);
-                activeMarkerSet = copy;
-            }
-            activeMarkerSet.markers.remove(activeMarkerSet.markers.size() - 1);
-            redrawKdaOverlays();
-            updateActiveMarkerSetLabel();
-            setStatus("Last marker removed from " + activeMarkerSet.id + ".");
         }
 
         private void clearAllKda() {
-            activeMarkerSet = null;
-            startFreshMarkerSetOnNextMark = true;
-            redrawKdaOverlays();
-            updateActiveMarkerSetLabel();
+            kdaMarkers.clear();
+            redrawKdaOverlay();
+            saveProject(false);
             if (kdaModeActive) {
-                setStatus("Markers cleared. The next marker starts a new set on the "
-                        + markingSourceType.displayName + ".");
-            } else {
-                setStatus("Markers cleared. Click Mark kDa Bands to start a new set.");
+                setStatus("kDa marking active. Click a marker band in the source image.");
             }
         }
 
@@ -686,19 +1226,14 @@ public class WBToolJava implements Command {
             cropButton.setText("Crop Region -> Figure");
             cropButton.setBackground(null);
 
-            KdaMarkerSet cropMarkerSet = markerSetApplicableToCurrentGel();
-            MarkerMapping markerMapping = markerMappingForCurrentGel(cropMarkerSet);
-            warnAboutMarkerMapping(cropMarkerSet);
             List<CropMarker> localMarkers = new ArrayList<CropMarker>();
-            if (cropMarkerSet != null) {
-                for (KdaMarker marker : cropMarkerSet.markers) {
-                    Point2D markerOnGel = markerInGelCoordinates(marker, cropMarkerSet);
-                    double yInCrop = markerYInCrop(
-                            markerOnGel.x, markerOnGel.y, crop.x, crop.y, crop.angleDeg);
-                    if (yInCrop >= -0.5 && yInCrop <= crop.height + 0.5) {
-                        localMarkers.add(new CropMarker(marker.label, yInCrop,
-                                marker.xAbs, marker.yAbs, markerOnGel.x, markerOnGel.y));
-                    }
+            for (KdaMarker marker : kdaMarkers) {
+                Point2D markerOnGel = markerInGelCoordinates(marker);
+                double yInCrop = markerYInCrop(
+                        markerOnGel.x, markerOnGel.y, crop.x, crop.y, crop.angleDeg);
+                if (yInCrop >= -0.5 && yInCrop <= crop.height + 0.5) {
+                    localMarkers.add(new CropMarker(
+                            marker.label, yInCrop, markerOnGel.x, markerOnGel.y));
                 }
             }
             Collections.sort(localMarkers, new Comparator<CropMarker>() {
@@ -719,19 +1254,16 @@ public class WBToolJava implements Command {
 
             BufferedImage image = crop.imagePlus.getProcessor().convertToRGB().getBufferedImage();
             int displayWidth = chooseInitialDisplayWidth(image.getWidth());
-            BandCrop band = new BandCrop(image, localMarkers, name.trim(), displayWidth,
-                    gelPath, gelImp.getWidth(), gelImp.getHeight(), cropMarkerSet, markerMapping);
+            BandCrop band = new BandCrop(image, localMarkers, name.trim(), displayWidth);
             band.cropX = crop.x;
             band.cropY = crop.y;
             band.cropWidth = crop.width;
             band.cropHeight = crop.height;
             band.cropAngleDeg = crop.angleDeg;
-            if (cropMarkerSet != null) {
-                cropMarkerSet.frozen = true;
-            }
             bands.add(band);
             selectedBand = band;
             figureCanvas.refreshLayout();
+            saveProject(false);
             gelImp.killRoi();
             activateGelImage();
             setCropSelectionTool();
@@ -830,22 +1362,13 @@ public class WBToolJava implements Command {
                 return null;
             }
 
-            return cropFromGeometry(imp, x, y, width, height, Math.toDegrees(angle));
-        }
-
-        private CropResult cropFromGeometry(ImagePlus imp, double x, double y,
-                int width, int height, double angleDeg) {
-            if (imp == null || width < 2 || height < 2) {
-                return null;
-            }
-            double angle = Math.toRadians(angleDeg);
             ImagePlus cropped;
             if (Math.abs(angle) < 0.0001) {
                 Roi oldRoi = imp.getRoi();
                 imp.setRoi((int) Math.round(x), (int) Math.round(y), width, height);
                 cropped = imp.crop();
                 imp.setRoi(oldRoi);
-                return new CropResult(cropped, x, y, width, height, angleDeg);
+                return new CropResult(cropped, x, y, width, height, 0.0);
             }
 
             BufferedImage src = imp.getProcessor().convertToRGB().getBufferedImage();
@@ -864,81 +1387,16 @@ public class WBToolJava implements Command {
             g.drawImage(src, transform, null);
             g.dispose();
             cropped = new ImagePlus("Rotated crop", out);
-            return new CropResult(cropped, x, y, width, height, angleDeg);
+            return new CropResult(cropped, x, y, width, height, Math.toDegrees(angle));
         }
 
-        private KdaMarkerSet markerSetApplicableToCurrentGel() {
-            if (activeMarkerSet == null || gelImp == null) {
-                return null;
-            }
-            if (activeMarkerSet.sourceType == MarkerSourceType.MARKER_IMAGE
-                    || samePath(activeMarkerSet.sourcePath, gelPath)) {
-                return activeMarkerSet;
-            }
-            return null;
-        }
-
-        private Point2D markerInGelCoordinates(KdaMarker marker, KdaMarkerSet markerSet) {
-            if (gelImp == null || markerSet == null
-                    || markerSet.sourceType == MarkerSourceType.GEL_IMAGE) {
+        private Point2D markerInGelCoordinates(KdaMarker marker) {
+            if (gelImp == null || markerImp == null || markerImp == gelImp) {
                 return new Point2D(marker.xAbs, marker.yAbs);
             }
-            double scaleX = gelImp.getWidth() / (double) markerSet.sourceWidth;
-            double scaleY = gelImp.getHeight() / (double) markerSet.sourceHeight;
+            double scaleX = gelImp.getWidth() / (double) markerImp.getWidth();
+            double scaleY = gelImp.getHeight() / (double) markerImp.getHeight();
             return new Point2D(marker.xAbs * scaleX, marker.yAbs * scaleY);
-        }
-
-        private MarkerMapping markerMappingForCurrentGel(KdaMarkerSet markerSet) {
-            if (markerSet == null || gelImp == null) {
-                return null;
-            }
-            double scaleX = gelImp.getWidth() / (double) markerSet.sourceWidth;
-            double scaleY = gelImp.getHeight() / (double) markerSet.sourceHeight;
-            boolean dimensionsDiffer = markerSet.sourceWidth != gelImp.getWidth()
-                    || markerSet.sourceHeight != gelImp.getHeight();
-            boolean aspectRatioMismatch = ((long) markerSet.sourceWidth) * gelImp.getHeight()
-                    != ((long) gelImp.getWidth()) * markerSet.sourceHeight;
-            return new MarkerMapping(markerSet.sourceWidth, markerSet.sourceHeight,
-                    gelImp.getWidth(), gelImp.getHeight(), scaleX, scaleY,
-                    dimensionsDiffer, aspectRatioMismatch);
-        }
-
-        private void warnAboutMarkerMapping(KdaMarkerSet markerSet) {
-            if (markerSet == null || markerSet.markers.isEmpty() || gelImp == null
-                    || markerSet.sourceType != MarkerSourceType.MARKER_IMAGE) {
-                return;
-            }
-            MarkerMapping mapping = markerMappingForCurrentGel(markerSet);
-            if (mapping == null || !mapping.dimensionsDiffer) {
-                return;
-            }
-            String warningKey = markerSet.id + "|" + gelPath + "|"
-                    + mapping.gelWidth + "x" + mapping.gelHeight;
-            if (!shownMappingWarnings.add(warningKey)) {
-                return;
-            }
-            StringBuilder message = new StringBuilder();
-            message.append("The kDa marker image is ")
-                    .append(mapping.markerWidth).append(" x ").append(mapping.markerHeight)
-                    .append(" pixels, while the Gel is ")
-                    .append(mapping.gelWidth).append(" x ").append(mapping.gelHeight)
-                    .append(" pixels.\n\n");
-            if (mapping.aspectRatioMismatch) {
-                message.append("Their width-to-height ratios are different. Marker coordinates ")
-                        .append("will be scaled independently in X and Y, and affected crops ")
-                        .append("will contain a warning in the coordinate log.");
-            } else {
-                message.append("Their aspect ratios match. Marker coordinates will be ")
-                        .append("scaled proportionally to the Gel dimensions.");
-            }
-            JOptionPane.showMessageDialog(frame, message.toString(),
-                    mapping.aspectRatioMismatch
-                            ? "kDa Aspect Ratio Warning" : "kDa Image Size Warning",
-                    JOptionPane.WARNING_MESSAGE);
-        }
-
-        private static boolean samePath(String first, String second) {
-            return first != null && second != null && first.equalsIgnoreCase(second);
         }
 
         private static double markerYInCrop(double markerX, double markerY,
@@ -968,6 +1426,7 @@ public class WBToolJava implements Command {
             int next = (int) Math.round(band.displayWidth * factor);
             band.displayWidth = Math.max(50, Math.min(next, band.image.getWidth() * 5));
             figureCanvas.refreshLayout();
+            saveProject(false);
             setStatus("Crop resized. kDa ticks were recomputed from the crop scale.");
         }
 
@@ -975,6 +1434,7 @@ public class WBToolJava implements Command {
             bands.clear();
             selectedBand = null;
             figureCanvas.refreshLayout();
+            saveProject(false);
         }
 
         private void exportPdf() {
@@ -983,6 +1443,7 @@ public class WBToolJava implements Command {
                         "Export PDF", JOptionPane.WARNING_MESSAGE);
                 return;
             }
+            saveProject(false);
             String dpiText = JOptionPane.showInputDialog(frame, "Raster DPI for crop images:", "300");
             if (dpiText == null) {
                 return;
@@ -1055,1033 +1516,6 @@ public class WBToolJava implements Command {
             return file;
         }
 
-        private void showCoordinateLog() {
-            final JDialog dialog = new JDialog(frame, "WB Tool Coordinate Log", false);
-            dialog.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
-            dialog.setLayout(new BorderLayout(8, 8));
-
-            final JTextArea textArea = new JTextArea(buildCoordinateLog(), 34, 92);
-            textArea.setEditable(false);
-            textArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
-            textArea.setLineWrap(false);
-            textArea.setCaretPosition(0);
-            dialog.add(new JScrollPane(textArea), BorderLayout.CENTER);
-
-            JPanel buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT));
-            JButton refresh = new JButton("Refresh");
-            refresh.addActionListener(new ActionListener() {
-                @Override
-                public void actionPerformed(ActionEvent event) {
-                    textArea.setText(buildCoordinateLog());
-                    textArea.setCaretPosition(0);
-                }
-            });
-            buttons.add(refresh);
-
-            JButton copy = new JButton("Copy");
-            copy.addActionListener(new ActionListener() {
-                @Override
-                public void actionPerformed(ActionEvent event) {
-                    Toolkit.getDefaultToolkit().getSystemClipboard()
-                            .setContents(new StringSelection(textArea.getText()), null);
-                    setStatus("Coordinate log copied to the clipboard.");
-                }
-            });
-            buttons.add(copy);
-
-            JButton save = new JButton("Save Log...");
-            save.addActionListener(new ActionListener() {
-                @Override
-                public void actionPerformed(ActionEvent event) {
-                    saveCoordinateLog(textArea.getText());
-                }
-            });
-            buttons.add(save);
-
-            JButton close = new JButton("Close");
-            close.addActionListener(new ActionListener() {
-                @Override
-                public void actionPerformed(ActionEvent event) {
-                    dialog.dispose();
-                }
-            });
-            buttons.add(close);
-            dialog.add(buttons, BorderLayout.SOUTH);
-
-            dialog.setSize(860, 650);
-            dialog.setLocationRelativeTo(frame);
-            dialog.setVisible(true);
-        }
-
-        private void showReconstructionLogDialog() {
-            final JDialog dialog = new JDialog(frame, "Reconstruct from Coordinate Log", true);
-            dialog.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
-            dialog.setLayout(new BorderLayout(8, 8));
-
-            final JTextArea textArea = new JTextArea(34, 92);
-            textArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
-            textArea.setLineWrap(false);
-            dialog.add(new JScrollPane(textArea), BorderLayout.CENTER);
-
-            JPanel buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT));
-            JButton load = new JButton("Load Log...");
-            load.addActionListener(new ActionListener() {
-                @Override
-                public void actionPerformed(ActionEvent event) {
-                    JFileChooser chooser = new JFileChooser();
-                    chooser.setDialogTitle("Load Coordinate Log");
-                    chooser.setFileFilter(new FileNameExtensionFilter(
-                            "Coordinate logs (TXT, LOG)", "txt", "log"));
-                    if (lastDir != null) {
-                        chooser.setCurrentDirectory(lastDir);
-                    }
-                    if (chooser.showOpenDialog(dialog) != JFileChooser.APPROVE_OPTION) {
-                        return;
-                    }
-                    File file = chooser.getSelectedFile();
-                    try {
-                        byte[] bytes = Files.readAllBytes(file.toPath());
-                        textArea.setText(new String(bytes, StandardCharsets.UTF_8));
-                        textArea.setCaretPosition(0);
-                        lastDir = file.getParentFile();
-                    } catch (Exception ex) {
-                        JOptionPane.showMessageDialog(dialog,
-                                "Could not load the coordinate log.\n"
-                                        + ex.getClass().getSimpleName() + ": " + ex.getMessage(),
-                                "Load Coordinate Log", JOptionPane.ERROR_MESSAGE);
-                    }
-                }
-            });
-            buttons.add(load);
-
-            JButton reconstruct = new JButton("Reconstruct");
-            reconstruct.addActionListener(new ActionListener() {
-                @Override
-                public void actionPerformed(ActionEvent event) {
-                    ParsedCoordinateLog parsed;
-                    try {
-                        parsed = parseCoordinateLog(textArea.getText());
-                    } catch (IllegalArgumentException ex) {
-                        JOptionPane.showMessageDialog(dialog, ex.getMessage(),
-                                "Invalid Coordinate Log", JOptionPane.ERROR_MESSAGE);
-                        return;
-                    }
-                    dialog.dispose();
-                    reconstructFromLog(parsed);
-                }
-            });
-            buttons.add(reconstruct);
-
-            JButton cancel = new JButton("Cancel");
-            cancel.addActionListener(new ActionListener() {
-                @Override
-                public void actionPerformed(ActionEvent event) {
-                    dialog.dispose();
-                }
-            });
-            buttons.add(cancel);
-            dialog.add(buttons, BorderLayout.SOUTH);
-
-            dialog.setSize(860, 650);
-            dialog.setLocationRelativeTo(frame);
-            dialog.setVisible(true);
-        }
-
-        private ParsedCoordinateLog parseCoordinateLog(String text) {
-            if (text == null || text.trim().length() == 0) {
-                throw new IllegalArgumentException("Paste a coordinate log or load one from a file.");
-            }
-            String normalized = text.replace("\r\n", "\n").replace('\r', '\n');
-            String[] lines = normalized.split("\n", -1);
-            if (lines.length == 0 || !"WB Tool Coordinate Log".equals(lines[0].trim())) {
-                throw new IllegalArgumentException(
-                        "This does not begin with a WB Tool Coordinate Log header.");
-            }
-
-            ParsedCoordinateLog parsed = new ParsedCoordinateLog();
-            int section = 0;
-            LoggedMarkerSet currentSet = null;
-            LoggedCrop currentCrop = null;
-            boolean inUsedMarkers = false;
-
-            for (int index = 1; index < lines.length; index++) {
-                String raw = lines[index];
-                String line = raw.trim();
-                int lineNumber = index + 1;
-                if (line.length() == 0) {
-                    continue;
-                }
-                if (line.startsWith("Log format version:")) {
-                    parsed.formatVersion = parseInteger(
-                            valueAfter(line, "Log format version:"), lineNumber, "log format version");
-                    continue;
-                }
-                if (line.startsWith("Plugin version:")) {
-                    parsed.pluginVersion = valueAfter(line, "Plugin version:");
-                    continue;
-                }
-                if ("Global kDa marker sets:".equals(line)) {
-                    section = 1;
-                    currentSet = null;
-                    continue;
-                }
-                if ("Crops in figure:".equals(line)) {
-                    section = 2;
-                    currentSet = null;
-                    continue;
-                }
-
-                if (section == 1) {
-                    if (!startsWithWhitespace(raw) && line.endsWith(":")) {
-                        String id = line.substring(0, line.length() - 1).trim();
-                        if (id.length() == 0 || "none".equalsIgnoreCase(id)) {
-                            continue;
-                        }
-                        currentSet = new LoggedMarkerSet(id);
-                        parsed.markerSets.add(currentSet);
-                        continue;
-                    }
-                    if (currentSet == null) {
-                        continue;
-                    }
-                    if (line.startsWith("Source type:")) {
-                        String type = valueAfter(line, "Source type:");
-                        if ("kDa marker image".equalsIgnoreCase(type)) {
-                            currentSet.sourceType = MarkerSourceType.MARKER_IMAGE;
-                        } else if ("Gel image".equalsIgnoreCase(type)) {
-                            currentSet.sourceType = MarkerSourceType.GEL_IMAGE;
-                        } else {
-                            throw parseError(lineNumber, "Unknown marker source type: " + type);
-                        }
-                    } else if (line.startsWith("Source image:")) {
-                        currentSet.sourcePath = unescapeLogValue(
-                                valueAfter(line, "Source image:"), parsed.formatVersion);
-                    } else if (line.startsWith("Source dimensions:")) {
-                        int[] dimensions = parseDimensions(
-                                valueAfter(line, "Source dimensions:"), lineNumber);
-                        currentSet.sourceWidth = dimensions[0];
-                        currentSet.sourceHeight = dimensions[1];
-                    } else if (isNumberedEntry(line) && line.contains(", x_abs = ")
-                            && line.contains(", y_abs = ")) {
-                        currentSet.markers.add(parseLoggedMarker(
-                                line, lineNumber, parsed.formatVersion));
-                    }
-                    continue;
-                }
-
-                if (section == 2) {
-                    if (!startsWithWhitespace(raw) && line.startsWith("Band ")) {
-                        int colon = line.indexOf(':');
-                        if (colon < 0) {
-                            throw parseError(lineNumber, "Band entry has no name separator.");
-                        }
-                        currentCrop = new LoggedCrop();
-                        currentCrop.name = unescapeLogValue(
-                                line.substring(colon + 1).trim(), parsed.formatVersion);
-                        parsed.crops.add(currentCrop);
-                        inUsedMarkers = false;
-                        continue;
-                    }
-                    if (currentCrop == null) {
-                        continue;
-                    }
-                    if ("Used kDa markers:".equals(line)) {
-                        inUsedMarkers = true;
-                    } else if (!inUsedMarkers && line.startsWith("Source image:")) {
-                        currentCrop.sourcePath = unescapeLogValue(
-                                valueAfter(line, "Source image:"), parsed.formatVersion);
-                    } else if (!inUsedMarkers && line.startsWith("Source dimensions:")) {
-                        int[] dimensions = parseDimensions(
-                                valueAfter(line, "Source dimensions:"), lineNumber);
-                        currentCrop.sourceWidth = dimensions[0];
-                        currentCrop.sourceHeight = dimensions[1];
-                    } else if (line.startsWith("Crop origin:")) {
-                        double[] pair = parseNamedPair(valueAfter(line, "Crop origin:"),
-                                "x", "y", lineNumber);
-                        currentCrop.cropX = pair[0];
-                        currentCrop.cropY = pair[1];
-                        currentCrop.hasOrigin = true;
-                    } else if (line.startsWith("Crop size:")) {
-                        double[] pair = parseNamedPair(valueAfter(line, "Crop size:"),
-                                "width", "height", lineNumber);
-                        currentCrop.cropWidth = (int) Math.round(pair[0]);
-                        currentCrop.cropHeight = (int) Math.round(pair[1]);
-                    } else if (line.startsWith("Crop angle:")) {
-                        String value = valueAfter(line, "Crop angle:");
-                        int degrees = value.indexOf(" degrees");
-                        if (degrees >= 0) {
-                            value = value.substring(0, degrees).trim();
-                        }
-                        currentCrop.cropAngleDeg = parseDouble(
-                                value, lineNumber, "crop angle");
-                    } else if (inUsedMarkers && line.startsWith("Marker set:")) {
-                        String markerSetId = valueAfter(line, "Marker set:");
-                        currentCrop.markerSetId = "none".equalsIgnoreCase(markerSetId)
-                                ? null : markerSetId;
-                    } else if (inUsedMarkers && isNumberedEntry(line)
-                            && line.contains(", y_in_crop = ")) {
-                        currentCrop.markers.add(parseLoggedCropMarker(
-                                line, lineNumber, parsed.formatVersion));
-                    }
-                }
-            }
-
-            validateParsedCoordinateLog(parsed);
-            return parsed;
-        }
-
-        private void validateParsedCoordinateLog(ParsedCoordinateLog parsed) {
-            if (parsed.formatVersion < 0) {
-                throw new IllegalArgumentException("Log format version cannot be negative.");
-            }
-            if (parsed.formatVersion > LOG_FORMAT_VERSION) {
-                throw new IllegalArgumentException("Log format version " + parsed.formatVersion
-                        + " is newer than this plugin supports (version "
-                        + LOG_FORMAT_VERSION + ").");
-            }
-            Map<String, LoggedMarkerSet> markerSetsById =
-                    new LinkedHashMap<String, LoggedMarkerSet>();
-            for (LoggedMarkerSet markerSet : parsed.markerSets) {
-                if (markerSet.sourceType == null || markerSet.sourcePath == null
-                        || markerSet.sourceWidth <= 0
-                        || markerSet.sourceHeight <= 0) {
-                    throw new IllegalArgumentException("Marker set " + markerSet.id
-                            + " is missing its source type, path, or dimensions.");
-                }
-                if (markerSetsById.containsKey(markerSet.id)) {
-                    throw new IllegalArgumentException(
-                            "The coordinate log contains duplicate marker set "
-                                    + markerSet.id + ".");
-                }
-                markerSetsById.put(markerSet.id, markerSet);
-            }
-            if (parsed.crops.isEmpty()) {
-                throw new IllegalArgumentException("The coordinate log contains no crops.");
-            }
-            int cropNumber = 1;
-            for (LoggedCrop crop : parsed.crops) {
-                if (crop.sourcePath == null || crop.sourceWidth <= 0 || crop.sourceHeight <= 0
-                        || !crop.hasOrigin || crop.cropWidth <= 0 || crop.cropHeight <= 0) {
-                    throw new IllegalArgumentException("Band " + cropNumber
-                            + " is missing its source image, dimensions, or crop geometry.");
-                }
-                if (crop.markerSetId != null && !markerSetsById.containsKey(crop.markerSetId)) {
-                    throw new IllegalArgumentException("Band " + cropNumber
-                            + " refers to unknown marker set " + crop.markerSetId + ".");
-                }
-                if (crop.markerSetId == null && !crop.markers.isEmpty()) {
-                    throw new IllegalArgumentException("Band " + cropNumber
-                            + " contains marker coordinates but names no marker set.");
-                }
-                cropNumber++;
-            }
-            parsed.markerSetsById.putAll(markerSetsById);
-        }
-
-        private static LoggedMarker parseLoggedMarker(
-                String line, int lineNumber, int formatVersion) {
-            int labelStart = line.indexOf("label = ");
-            int xStart = line.indexOf(", x_abs = ", labelStart);
-            int yStart = line.indexOf(", y_abs = ", xStart);
-            if (labelStart < 0 || xStart < 0 || yStart < 0) {
-                throw parseError(lineNumber, "Invalid marker coordinate entry.");
-            }
-            String label = unescapeLogValue(
-                    line.substring(labelStart + "label = ".length(), xStart).trim(),
-                    formatVersion);
-            double x = parseDouble(line.substring(xStart + ", x_abs = ".length(), yStart).trim(),
-                    lineNumber, "marker x coordinate");
-            double y = parseDouble(line.substring(yStart + ", y_abs = ".length()).trim(),
-                    lineNumber, "marker y coordinate");
-            return new LoggedMarker(label, x, y);
-        }
-
-        private static LoggedCropMarker parseLoggedCropMarker(
-                String line, int lineNumber, int formatVersion) {
-            int labelStart = line.indexOf("label = ");
-            int sourceXStart = line.indexOf(", source_x_abs = ", labelStart);
-            int sourceYStart = line.indexOf(", source_y_abs = ", sourceXStart);
-            int gelXStart = line.indexOf(", gel_x_abs = ", sourceYStart);
-            int gelYStart = line.indexOf(", gel_y_abs = ", gelXStart);
-            int yInCropStart = line.lastIndexOf(", y_in_crop = ");
-            if (labelStart < 0 || sourceXStart < 0 || sourceYStart < 0
-                    || gelXStart < 0 || gelYStart < 0 || yInCropStart < 0) {
-                throw parseError(lineNumber, "Invalid crop marker entry.");
-            }
-            String label = unescapeLogValue(
-                    line.substring(labelStart + "label = ".length(), sourceXStart).trim(),
-                    formatVersion);
-            double sourceX = parseDouble(line.substring(
-                    sourceXStart + ", source_x_abs = ".length(), sourceYStart).trim(),
-                    lineNumber, "source marker x coordinate");
-            double sourceY = parseDouble(line.substring(
-                    sourceYStart + ", source_y_abs = ".length(), gelXStart).trim(),
-                    lineNumber, "source marker y coordinate");
-            double gelX = parseDouble(line.substring(
-                    gelXStart + ", gel_x_abs = ".length(), gelYStart).trim(),
-                    lineNumber, "Gel marker x coordinate");
-            double gelY = parseDouble(line.substring(
-                    gelYStart + ", gel_y_abs = ".length(), yInCropStart).trim(),
-                    lineNumber, "Gel marker y coordinate");
-            double yInCrop = parseDouble(
-                    line.substring(yInCropStart + ", y_in_crop = ".length()).trim(),
-                    lineNumber, "marker y_in_crop coordinate");
-            return new LoggedCropMarker(label, sourceX, sourceY, gelX, gelY, yInCrop);
-        }
-
-        private static int[] parseDimensions(String value, int lineNumber) {
-            String cleaned = value.replace(" pixels", "").trim();
-            int separator = cleaned.indexOf(" x ");
-            if (separator < 0) {
-                throw parseError(lineNumber, "Invalid image dimensions.");
-            }
-            int width = parseInteger(cleaned.substring(0, separator).trim(),
-                    lineNumber, "image width");
-            int height = parseInteger(cleaned.substring(separator + 3).trim(),
-                    lineNumber, "image height");
-            return new int[] {width, height};
-        }
-
-        private static double[] parseNamedPair(String value, String firstName,
-                String secondName, int lineNumber) {
-            String firstPrefix = firstName + " = ";
-            String secondPrefix = ", " + secondName + " = ";
-            int firstStart = value.indexOf(firstPrefix);
-            int secondStart = value.indexOf(secondPrefix, firstStart + firstPrefix.length());
-            if (firstStart < 0 || secondStart < 0) {
-                throw parseError(lineNumber, "Invalid " + firstName + "/" + secondName + " pair.");
-            }
-            String firstValue = value.substring(firstStart + firstPrefix.length(), secondStart).trim();
-            String secondValue = value.substring(secondStart + secondPrefix.length())
-                    .replace(" pixels", "").trim();
-            return new double[] {
-                parseDouble(firstValue, lineNumber, firstName),
-                parseDouble(secondValue, lineNumber, secondName)
-            };
-        }
-
-        private static String valueAfter(String line, String prefix) {
-            return line.substring(prefix.length()).trim();
-        }
-
-        private static int parseInteger(String value, int lineNumber, String field) {
-            try {
-                return Integer.parseInt(value);
-            } catch (NumberFormatException ex) {
-                throw parseError(lineNumber, "Invalid " + field + ": " + value);
-            }
-        }
-
-        private static double parseDouble(String value, int lineNumber, String field) {
-            try {
-                double parsed = Double.parseDouble(value);
-                if (Double.isNaN(parsed) || Double.isInfinite(parsed)) {
-                    throw parseError(lineNumber, "Invalid " + field + ": " + value);
-                }
-                return parsed;
-            } catch (NumberFormatException ex) {
-                throw parseError(lineNumber, "Invalid " + field + ": " + value);
-            }
-        }
-
-        private static boolean startsWithWhitespace(String value) {
-            return value.length() > 0 && Character.isWhitespace(value.charAt(0));
-        }
-
-        private static boolean isNumberedEntry(String value) {
-            int dot = value.indexOf('.');
-            if (dot <= 0) {
-                return false;
-            }
-            for (int i = 0; i < dot; i++) {
-                if (!Character.isDigit(value.charAt(i))) {
-                    return false;
-                }
-            }
-            return true;
-        }
-
-        private static IllegalArgumentException parseError(int lineNumber, String message) {
-            return new IllegalArgumentException("Coordinate log line " + lineNumber + ": " + message);
-        }
-
-        private static String unescapeLogValue(String value, int formatVersion) {
-            return value;
-        }
-
-        private void reconstructFromLog(ParsedCoordinateLog parsed) {
-            LinkedHashMap<String, ReconstructionImageRequest> requests =
-                    buildReconstructionImageRequests(parsed);
-            for (ReconstructionImageRequest request : requests.values()) {
-                if (!selectReconstructionImage(request)) {
-                    setStatus("Reconstruction cancelled.");
-                    return;
-                }
-            }
-
-            Controller reconstructed = new Controller(
-                    TITLE + " - Reconstructed from coordinate log");
-            reconstructed.showFrame();
-
-            Map<String, KdaMarkerSet> reconstructedSets =
-                    new LinkedHashMap<String, KdaMarkerSet>();
-            int highestMarkerSetNumber = 0;
-            for (LoggedMarkerSet loggedSet : parsed.markerSets) {
-                KdaMarkerSet markerSet = new KdaMarkerSet(loggedSet.id, loggedSet.sourceType,
-                        loggedSet.sourcePath, loggedSet.sourceWidth, loggedSet.sourceHeight);
-                for (LoggedMarker marker : loggedSet.markers) {
-                    markerSet.markers.add(new KdaMarker(marker.xAbs, marker.yAbs, marker.label));
-                }
-                markerSet.frozen = true;
-                reconstructed.markerSets.add(markerSet);
-                reconstructedSets.put(markerSet.id, markerSet);
-                highestMarkerSetNumber = Math.max(
-                        highestMarkerSetNumber, markerSetNumber(markerSet.id));
-            }
-            reconstructed.nextMarkerSetNumber = highestMarkerSetNumber + 1;
-
-            List<String> reconstructionWarnings = new ArrayList<String>();
-            for (ReconstructionImageRequest request : requests.values()) {
-                if (request.dimensionMismatch && request.loadedImage != null) {
-                    reconstructionWarnings.add("Selected dimensions differ for "
-                            + request.originalPath
-                            + (request.aspectRatioMismatch
-                                    ? "; the aspect ratios also differ." : "."));
-                }
-                if (request.conflictingLoggedDimensions) {
-                    reconstructionWarnings.add("The log contains conflicting dimensions for "
-                            + request.originalPath + ".");
-                }
-            }
-
-            int bandNumber = 1;
-            for (LoggedCrop loggedCrop : parsed.crops) {
-                ReconstructionImageRequest request = requests.get(
-                        reconstructionRequestKey(loggedCrop.sourcePath));
-                if (request == null || request.loadedImage == null) {
-                    JOptionPane.showMessageDialog(frame,
-                            "Required Gel image is missing for Band " + bandNumber + ".",
-                            "Reconstruction Failed", JOptionPane.ERROR_MESSAGE);
-                    reconstructed.frame.dispose();
-                    return;
-                }
-                ReconstructedGeometry geometry = scaleLoggedCropGeometry(
-                        loggedCrop, request.loadedImage.imagePlus);
-                CropResult crop = reconstructed.cropFromGeometry(
-                        request.loadedImage.imagePlus, geometry.x, geometry.y,
-                        geometry.width, geometry.height, geometry.angleDeg);
-                if (crop == null) {
-                    JOptionPane.showMessageDialog(frame,
-                            "Could not reconstruct Band " + bandNumber
-                                    + " from the selected Gel image.",
-                            "Reconstruction Failed", JOptionPane.ERROR_MESSAGE);
-                    reconstructed.frame.dispose();
-                    return;
-                }
-
-                double localScaleY = crop.height / (double) loggedCrop.cropHeight;
-                List<CropMarker> cropMarkers = new ArrayList<CropMarker>();
-                for (LoggedCropMarker marker : loggedCrop.markers) {
-                    cropMarkers.add(new CropMarker(marker.label,
-                            marker.yInCrop * localScaleY,
-                            marker.sourceXAbs, marker.sourceYAbs,
-                            marker.gelXAbs, marker.gelYAbs));
-                }
-                Collections.sort(cropMarkers, new Comparator<CropMarker>() {
-                    @Override
-                    public int compare(CropMarker first, CropMarker second) {
-                        return Double.compare(first.yInCrop, second.yInCrop);
-                    }
-                });
-
-                BufferedImage image = crop.imagePlus.getProcessor()
-                        .convertToRGB().getBufferedImage();
-                int displayWidth = reconstructed.chooseInitialDisplayWidth(image.getWidth());
-                KdaMarkerSet markerSet = loggedCrop.markerSetId == null
-                        ? null : reconstructedSets.get(loggedCrop.markerSetId);
-                MarkerMapping markerMapping = markerMappingForLoggedCrop(markerSet, loggedCrop);
-                BandCrop band = new BandCrop(image, cropMarkers, loggedCrop.name, displayWidth,
-                        loggedCrop.sourcePath, loggedCrop.sourceWidth, loggedCrop.sourceHeight,
-                        markerSet, markerMapping);
-                band.cropX = loggedCrop.cropX;
-                band.cropY = loggedCrop.cropY;
-                band.cropWidth = loggedCrop.cropWidth;
-                band.cropHeight = loggedCrop.cropHeight;
-                band.cropAngleDeg = loggedCrop.cropAngleDeg;
-                reconstructed.bands.add(band);
-                reconstructed.selectedBand = band;
-                bandNumber++;
-            }
-            reconstructed.figureCanvas.refreshLayout();
-
-            List<String> skippedMarkerSets = new ArrayList<String>();
-            int annotatedIndex = 0;
-            for (LoggedMarkerSet loggedSet : parsed.markerSets) {
-                ReconstructionImageRequest request = requests.get(
-                        reconstructionRequestKey(loggedSet.sourcePath));
-                if (request == null || request.loadedImage == null) {
-                    skippedMarkerSets.add(loggedSet.id);
-                    continue;
-                }
-                KdaMarkerSet markerSet = reconstructedSets.get(loggedSet.id);
-                reconstructed.openAnnotatedMarkerImage(
-                        markerSet, request.loadedImage, annotatedIndex++);
-            }
-
-            String status = "Reconstructed " + reconstructed.bands.size()
-                    + " crop(s) from coordinate log.";
-            if (!skippedMarkerSets.isEmpty()) {
-                status += " Marker sources not supplied: " + joinValues(skippedMarkerSets) + ".";
-            }
-            reconstructed.setStatus(status);
-            reconstructed.frame.toFront();
-
-            if (!skippedMarkerSets.isEmpty() || !reconstructionWarnings.isEmpty()) {
-                StringBuilder warning = new StringBuilder();
-                warning.append("The figure was reconstructed with warnings.\n");
-                if (!skippedMarkerSets.isEmpty()) {
-                    warning.append("\nMarker source images were not supplied for: ")
-                            .append(joinValues(skippedMarkerSets)).append(".");
-                }
-                for (String item : reconstructionWarnings) {
-                    warning.append("\n").append(item);
-                }
-                JOptionPane.showMessageDialog(reconstructed.frame, warning.toString(),
-                        "Reconstruction Warnings", JOptionPane.WARNING_MESSAGE);
-            }
-        }
-
-        private LinkedHashMap<String, ReconstructionImageRequest>
-                buildReconstructionImageRequests(ParsedCoordinateLog parsed) {
-            LinkedHashMap<String, ReconstructionImageRequest> requests =
-                    new LinkedHashMap<String, ReconstructionImageRequest>();
-            int bandNumber = 1;
-            for (LoggedCrop crop : parsed.crops) {
-                ReconstructionImageRequest request = getOrCreateReconstructionRequest(
-                        requests, crop.sourcePath, crop.sourceWidth, crop.sourceHeight);
-                request.required = true;
-                request.addRole("Gel for Band " + bandNumber + " (" + crop.name + ")");
-                bandNumber++;
-            }
-            for (LoggedMarkerSet markerSet : parsed.markerSets) {
-                ReconstructionImageRequest request = getOrCreateReconstructionRequest(
-                        requests, markerSet.sourcePath,
-                        markerSet.sourceWidth, markerSet.sourceHeight);
-                request.addRole("Marker source for " + markerSet.id);
-            }
-            return requests;
-        }
-
-        private static ReconstructionImageRequest getOrCreateReconstructionRequest(
-                LinkedHashMap<String, ReconstructionImageRequest> requests,
-                String path, int width, int height) {
-            String key = reconstructionRequestKey(path);
-            ReconstructionImageRequest request = requests.get(key);
-            if (request == null) {
-                request = new ReconstructionImageRequest(path, width, height);
-                requests.put(key, request);
-            } else if (request.expectedWidth != width || request.expectedHeight != height) {
-                request.conflictingLoggedDimensions = true;
-            }
-            return request;
-        }
-
-        private boolean selectReconstructionImage(ReconstructionImageRequest request) {
-            while (true) {
-                JFileChooser chooser = new JFileChooser();
-                chooser.setDialogTitle(request.required
-                        ? "Select Required Gel Image" : "Select Marker Source Image");
-                chooser.setApproveButtonText("Use Image");
-                chooser.setFileFilter(new FileNameExtensionFilter(
-                        "Image files (TIFF, PNG, JPEG)", "tif", "tiff", "png", "jpg", "jpeg"));
-                if (lastDir != null) {
-                    chooser.setCurrentDirectory(lastDir);
-                }
-
-                JTextArea details = new JTextArea(reconstructionImageDetails(request), 9, 34);
-                details.setEditable(false);
-                details.setOpaque(false);
-                details.setLineWrap(true);
-                details.setWrapStyleWord(true);
-                chooser.setAccessory(details);
-
-                if (chooser.showOpenDialog(frame) != JFileChooser.APPROVE_OPTION) {
-                    if (request.required) {
-                        return false;
-                    }
-                    Object[] options = {"Skip Marker Source", "Choose Again", "Cancel Reconstruction"};
-                    int choice = JOptionPane.showOptionDialog(frame,
-                            "No image was selected for this optional marker source.",
-                            "Marker Source Image", JOptionPane.DEFAULT_OPTION,
-                            JOptionPane.QUESTION_MESSAGE, null, options, options[0]);
-                    if (choice == 0) {
-                        return true;
-                    }
-                    if (choice == 1) {
-                        continue;
-                    }
-                    return false;
-                }
-
-                File selected = chooser.getSelectedFile();
-                LoadedImage loaded = loadRgbImage(selected);
-                if (loaded == null) {
-                    continue;
-                }
-                lastDir = selected.getParentFile();
-                if (lastDir != null) {
-                    Prefs.set("wbtool.last_dir", lastDir.getAbsolutePath());
-                }
-
-                if (loaded.imagePlus.getWidth() != request.expectedWidth
-                        || loaded.imagePlus.getHeight() != request.expectedHeight) {
-                    boolean ratioMismatch = ((long) loaded.imagePlus.getWidth())
-                            * request.expectedHeight
-                            != ((long) request.expectedWidth) * loaded.imagePlus.getHeight();
-                    StringBuilder warning = new StringBuilder();
-                    warning.append("The log expects ")
-                            .append(request.expectedWidth).append(" x ")
-                            .append(request.expectedHeight).append(" pixels, but the selected image is ")
-                            .append(loaded.imagePlus.getWidth()).append(" x ")
-                            .append(loaded.imagePlus.getHeight()).append(" pixels.\n\n");
-                    warning.append(ratioMismatch
-                            ? "The aspect ratios differ, so this will not be an exact reconstruction."
-                            : "The aspect ratios match and coordinates can be scaled proportionally.");
-                    int choice = JOptionPane.showConfirmDialog(frame, warning.toString()
-                                    + "\n\nUse this image anyway?",
-                            "Reconstruction Image Size Warning",
-                            JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
-                    if (choice != JOptionPane.YES_OPTION) {
-                        continue;
-                    }
-                    request.dimensionMismatch = true;
-                    request.aspectRatioMismatch = ratioMismatch;
-                }
-                request.loadedImage = loaded;
-                return true;
-            }
-        }
-
-        private LoadedImage loadRgbImage(File file) {
-            ImagePlus imp = IJ.openImage(file.getAbsolutePath());
-            if (imp == null) {
-                JOptionPane.showMessageDialog(frame, "Could not open: " + file.getAbsolutePath(),
-                        "Open Reconstruction Image", JOptionPane.ERROR_MESSAGE);
-                return null;
-            }
-            if (imp.getType() != ImagePlus.COLOR_RGB) {
-                new ImageConverter(imp).convertToRGB();
-            }
-            String path;
-            try {
-                path = file.getCanonicalPath();
-            } catch (Exception ignored) {
-                path = file.getAbsolutePath();
-            }
-            return new LoadedImage(imp, path);
-        }
-
-        private static String reconstructionImageDetails(ReconstructionImageRequest request) {
-            StringBuilder details = new StringBuilder();
-            details.append(request.required ? "Required Gel image" : "Optional marker source")
-                    .append("\n\nExpected path:\n").append(request.originalPath)
-                    .append("\n\nLogged dimensions: ")
-                    .append(request.expectedWidth).append(" x ").append(request.expectedHeight)
-                    .append(" pixels\n\nUsed as:\n");
-            for (String role : request.roles) {
-                details.append("- ").append(role).append("\n");
-            }
-            if (request.conflictingLoggedDimensions) {
-                details.append("\nWarning: this path has conflicting dimensions in the log.");
-            }
-            return details.toString();
-        }
-
-        private static ReconstructedGeometry scaleLoggedCropGeometry(
-                LoggedCrop crop, ImagePlus selectedImage) {
-            double scaleX = selectedImage.getWidth() / (double) crop.sourceWidth;
-            double scaleY = selectedImage.getHeight() / (double) crop.sourceHeight;
-            double angle = Math.toRadians(crop.cropAngleDeg);
-
-            Point2D topLeft = new Point2D(crop.cropX * scaleX, crop.cropY * scaleY);
-            Point2D topRight = new Point2D(
-                    (crop.cropX + crop.cropWidth * Math.cos(angle)) * scaleX,
-                    (crop.cropY + crop.cropWidth * Math.sin(angle)) * scaleY);
-            Point2D bottomLeft = new Point2D(
-                    (crop.cropX - crop.cropHeight * Math.sin(angle)) * scaleX,
-                    (crop.cropY + crop.cropHeight * Math.cos(angle)) * scaleY);
-
-            int width = Math.max(2, (int) Math.round(distance(
-                    topLeft.x, topLeft.y, topRight.x, topRight.y)));
-            int height = Math.max(2, (int) Math.round(distance(
-                    topLeft.x, topLeft.y, bottomLeft.x, bottomLeft.y)));
-            double scaledAngle = Math.toDegrees(Math.atan2(
-                    topRight.y - topLeft.y, topRight.x - topLeft.x));
-            return new ReconstructedGeometry(
-                    topLeft.x, topLeft.y, width, height, scaledAngle);
-        }
-
-        private static MarkerMapping markerMappingForLoggedCrop(
-                KdaMarkerSet markerSet, LoggedCrop crop) {
-            if (markerSet == null) {
-                return null;
-            }
-            double scaleX = crop.sourceWidth / (double) markerSet.sourceWidth;
-            double scaleY = crop.sourceHeight / (double) markerSet.sourceHeight;
-            boolean dimensionsDiffer = markerSet.sourceWidth != crop.sourceWidth
-                    || markerSet.sourceHeight != crop.sourceHeight;
-            boolean ratioMismatch = ((long) markerSet.sourceWidth) * crop.sourceHeight
-                    != ((long) crop.sourceWidth) * markerSet.sourceHeight;
-            return new MarkerMapping(markerSet.sourceWidth, markerSet.sourceHeight,
-                    crop.sourceWidth, crop.sourceHeight, scaleX, scaleY,
-                    dimensionsDiffer, ratioMismatch);
-        }
-
-        private void openAnnotatedMarkerImage(KdaMarkerSet markerSet,
-                LoadedImage loadedImage, int index) {
-            if (markerSet == null || loadedImage == null) {
-                return;
-            }
-            ImagePlus annotatedImage = new ImagePlus(
-                    markerSet.id + " - marker source - " + new File(loadedImage.path).getName(),
-                    loadedImage.imagePlus.getProcessor().duplicate());
-            double scaleX = annotatedImage.getWidth() / (double) markerSet.sourceWidth;
-            double scaleY = annotatedImage.getHeight() / (double) markerSet.sourceHeight;
-            AnnotatedMarkerImage annotated = new AnnotatedMarkerImage(
-                    annotatedImage, markerSet, scaleX, scaleY);
-            annotatedMarkerImages.add(annotated);
-            annotatedImage.show();
-            Dimension screen = Toolkit.getDefaultToolkit().getScreenSize();
-            if (annotatedImage.getWindow() != null) {
-                int offset = (index % 8) * 24;
-                annotatedImage.getWindow().setLocation(screen.width / 2 + offset, offset);
-                annotatedImage.getWindow().setSize(
-                        Math.max(320, screen.width / 2 - offset),
-                        Math.max(280, screen.height - offset));
-            }
-            drawKdaOverlay(annotatedImage, markerSet, scaleX, scaleY);
-        }
-
-        private static String reconstructionRequestKey(String path) {
-            if (path == null) {
-                return "";
-            }
-            return File.separatorChar == '\\' ? path.toLowerCase(Locale.US) : path;
-        }
-
-        private static String joinValues(List<String> values) {
-            StringBuilder joined = new StringBuilder();
-            for (String value : values) {
-                if (joined.length() > 0) {
-                    joined.append(", ");
-                }
-                joined.append(value);
-            }
-            return joined.toString();
-        }
-
-        private static int markerSetNumber(String id) {
-            if (id == null) {
-                return 0;
-            }
-            int dash = id.lastIndexOf('-');
-            if (dash < 0 || dash == id.length() - 1) {
-                return 0;
-            }
-            try {
-                return Integer.parseInt(id.substring(dash + 1));
-            } catch (NumberFormatException ignored) {
-                return 0;
-            }
-        }
-
-        private void saveCoordinateLog(String text) {
-            File path = chooseSavePath("Save Coordinate Log", "Text files", "txt");
-            if (path == null) {
-                return;
-            }
-            Writer writer = null;
-            try {
-                writer = new OutputStreamWriter(new FileOutputStream(path), StandardCharsets.UTF_8);
-                writer.write(text);
-                writer.close();
-                setStatus("Coordinate log saved: " + path.getAbsolutePath());
-            } catch (Exception ex) {
-                try {
-                    if (writer != null) {
-                        writer.close();
-                    }
-                } catch (Exception ignored) {
-                    // Preserve the original save error.
-                }
-                JOptionPane.showMessageDialog(frame,
-                        "Could not save the coordinate log.\n"
-                                + ex.getClass().getSimpleName() + ": " + ex.getMessage(),
-                        "Save Coordinate Log", JOptionPane.ERROR_MESSAGE);
-            }
-        }
-
-        private String buildCoordinateLog() {
-            StringBuilder log = new StringBuilder();
-            log.append("WB Tool Coordinate Log\n");
-            log.append("Log format version: ").append(LOG_FORMAT_VERSION).append("\n");
-            log.append("Plugin version: ").append(VERSION).append("\n\n");
-            log.append("Coordinate convention:\n");
-            log.append("  Origin: top-left image pixel\n");
-            log.append("  X direction: right\n");
-            log.append("  Y direction: down\n");
-            log.append("  Crop corners: top-left, top-right, bottom-right, bottom-left\n");
-            log.append("  Angles: degrees clockwise in image coordinates\n\n");
-
-            log.append("Global kDa marker sets:\n");
-            boolean wroteMarkerSet = false;
-            for (KdaMarkerSet markerSet : markerSets) {
-                if (markerSet.markers.isEmpty() && !isMarkerSetUsed(markerSet)) {
-                    continue;
-                }
-                wroteMarkerSet = true;
-                log.append(markerSet.id).append(":\n");
-                log.append("  Source type: ").append(markerSet.sourceType.displayName).append("\n");
-                log.append("  Source image: ").append(logValue(markerSet.sourcePath)).append("\n");
-                log.append("  Source dimensions: ").append(markerSet.sourceWidth).append(" x ")
-                        .append(markerSet.sourceHeight).append(" pixels\n");
-                log.append("  Markers:\n");
-                if (markerSet.markers.isEmpty()) {
-                    log.append("    none\n");
-                } else {
-                    int markerNumber = 1;
-                    for (KdaMarker marker : markerSet.markers) {
-                        log.append("    ").append(markerNumber++).append(". label = ")
-                                .append(logValue(marker.label))
-                                .append(", x_abs = ").append(formatCoordinate(marker.xAbs))
-                                .append(", y_abs = ").append(formatCoordinate(marker.yAbs))
-                                .append("\n");
-                    }
-                }
-                log.append("\n");
-            }
-            if (!wroteMarkerSet) {
-                log.append("  none\n\n");
-            }
-
-            log.append("Crops in figure:\n");
-            if (bands.isEmpty()) {
-                log.append("  none\n");
-                return log.toString();
-            }
-
-            int bandNumber = 1;
-            for (BandCrop band : bands) {
-                log.append("Band ").append(bandNumber++).append(": ")
-                        .append(logValue(band.label)).append("\n");
-                log.append("  Source image: ").append(logValue(band.sourcePath)).append("\n");
-                log.append("  Source dimensions: ").append(band.sourceWidth).append(" x ")
-                        .append(band.sourceHeight).append(" pixels\n");
-                log.append("  Crop origin: x = ").append(formatCoordinate(band.cropX))
-                        .append(", y = ").append(formatCoordinate(band.cropY)).append("\n");
-                log.append("  Crop size: width = ").append(band.cropWidth)
-                        .append(", height = ").append(band.cropHeight).append(" pixels\n");
-                log.append("  Crop angle: ").append(formatCoordinate(band.cropAngleDeg))
-                        .append(" degrees\n");
-                Point2D[] corners = cropCorners(band);
-                log.append("  Crop corners:\n");
-                appendCorner(log, "top-left", corners[0]);
-                appendCorner(log, "top-right", corners[1]);
-                appendCorner(log, "bottom-right", corners[2]);
-                appendCorner(log, "bottom-left", corners[3]);
-
-                log.append("  Used kDa markers:\n");
-                if (band.markerSet == null) {
-                    log.append("    Marker set: none\n");
-                } else {
-                    log.append("    Marker set: ").append(band.markerSet.id).append("\n");
-                    log.append("    Marker source image: ")
-                            .append(logValue(band.markerSet.sourcePath)).append("\n");
-                    if (band.markerMapping != null) {
-                        MarkerMapping mapping = band.markerMapping;
-                        log.append("    Marker source dimensions: ")
-                                .append(mapping.markerWidth).append(" x ")
-                                .append(mapping.markerHeight).append(" pixels\n");
-                        log.append("    Gel dimensions: ").append(mapping.gelWidth).append(" x ")
-                                .append(mapping.gelHeight).append(" pixels\n");
-                        log.append("    Coordinate scale: x = ")
-                                .append(formatCoordinate(mapping.scaleX))
-                                .append(", y = ").append(formatCoordinate(mapping.scaleY)).append("\n");
-                        if (mapping.aspectRatioMismatch) {
-                            log.append("    WARNING: Marker source and Gel have different ")
-                                    .append("width-to-height ratios.\n");
-                        } else if (mapping.dimensionsDiffer) {
-                            log.append("    Note: Image dimensions differ, but their aspect ratios match.\n");
-                        }
-                    }
-                    if (band.markers.isEmpty()) {
-                        log.append("    No markers from this set fell within the crop.\n");
-                    } else {
-                        int usedNumber = 1;
-                        for (CropMarker marker : band.markers) {
-                            log.append("    ").append(usedNumber++).append(". label = ")
-                                    .append(logValue(marker.label))
-                                    .append(", source_x_abs = ")
-                                    .append(formatCoordinate(marker.sourceXAbs))
-                                    .append(", source_y_abs = ")
-                                    .append(formatCoordinate(marker.sourceYAbs))
-                                    .append(", gel_x_abs = ")
-                                    .append(formatCoordinate(marker.gelXAbs))
-                                    .append(", gel_y_abs = ")
-                                    .append(formatCoordinate(marker.gelYAbs))
-                                    .append(", y_in_crop = ")
-                                    .append(formatCoordinate(marker.yInCrop)).append("\n");
-                        }
-                    }
-                }
-                log.append("\n");
-            }
-            return log.toString();
-        }
-
-        private boolean isMarkerSetUsed(KdaMarkerSet markerSet) {
-            for (BandCrop band : bands) {
-                if (band.markerSet == markerSet) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        private static Point2D[] cropCorners(BandCrop band) {
-            double angle = Math.toRadians(band.cropAngleDeg);
-            double cos = Math.cos(angle);
-            double sin = Math.sin(angle);
-            Point2D topLeft = new Point2D(band.cropX, band.cropY);
-            Point2D topRight = new Point2D(
-                    band.cropX + band.cropWidth * cos,
-                    band.cropY + band.cropWidth * sin);
-            Point2D bottomLeft = new Point2D(
-                    band.cropX - band.cropHeight * sin,
-                    band.cropY + band.cropHeight * cos);
-            Point2D bottomRight = new Point2D(
-                    topRight.x + bottomLeft.x - topLeft.x,
-                    topRight.y + bottomLeft.y - topLeft.y);
-            return new Point2D[] {topLeft, topRight, bottomRight, bottomLeft};
-        }
-
-        private static void appendCorner(StringBuilder log, String name, Point2D point) {
-            log.append("    ").append(name).append(": x = ")
-                    .append(formatCoordinate(point.x)).append(", y = ")
-                    .append(formatCoordinate(point.y)).append("\n");
-        }
-
-        private static String formatCoordinate(double value) {
-            return String.format(Locale.US, "%.6f", Double.valueOf(value));
-        }
-
-        private static String logValue(String value) {
-            if (value == null) {
-                return "unknown";
-            }
-            return value.replace("\r", "\\r").replace("\n", "\\n");
-        }
-
         private void setStatus(String text) {
             statusLabel.setText(text == null ? " " : text);
         }
@@ -2097,6 +1531,11 @@ public class WBToolJava implements Command {
         private void selectBand(BandCrop band) {
             selectedBand = band;
             figureCanvas.repaint();
+        }
+
+        private void figureLayoutChanged() {
+            saveProject(false);
+            setStatus("Figure layout updated and saved.");
         }
     }
 
@@ -2136,6 +1575,9 @@ public class WBToolJava implements Command {
 
                 @Override
                 public void mouseReleased(MouseEvent event) {
+                    if (dragBand != null) {
+                        controller.figureLayoutChanged();
+                    }
                     dragBand = null;
                     dragLast = null;
                 }
@@ -2249,183 +1691,6 @@ public class WBToolJava implements Command {
         }
     }
 
-    private static final class ParsedCoordinateLog {
-        int formatVersion;
-        String pluginVersion;
-        final List<LoggedMarkerSet> markerSets = new ArrayList<LoggedMarkerSet>();
-        final Map<String, LoggedMarkerSet> markerSetsById =
-                new LinkedHashMap<String, LoggedMarkerSet>();
-        final List<LoggedCrop> crops = new ArrayList<LoggedCrop>();
-    }
-
-    private static final class LoggedMarkerSet {
-        final String id;
-        MarkerSourceType sourceType;
-        String sourcePath;
-        int sourceWidth;
-        int sourceHeight;
-        final List<LoggedMarker> markers = new ArrayList<LoggedMarker>();
-
-        LoggedMarkerSet(String id) {
-            this.id = id;
-        }
-    }
-
-    private static final class LoggedMarker {
-        final String label;
-        final double xAbs;
-        final double yAbs;
-
-        LoggedMarker(String label, double xAbs, double yAbs) {
-            this.label = label;
-            this.xAbs = xAbs;
-            this.yAbs = yAbs;
-        }
-    }
-
-    private static final class LoggedCrop {
-        String name;
-        String sourcePath;
-        int sourceWidth;
-        int sourceHeight;
-        double cropX;
-        double cropY;
-        int cropWidth;
-        int cropHeight;
-        double cropAngleDeg;
-        boolean hasOrigin;
-        String markerSetId;
-        final List<LoggedCropMarker> markers = new ArrayList<LoggedCropMarker>();
-    }
-
-    private static final class LoggedCropMarker {
-        final String label;
-        final double sourceXAbs;
-        final double sourceYAbs;
-        final double gelXAbs;
-        final double gelYAbs;
-        final double yInCrop;
-
-        LoggedCropMarker(String label, double sourceXAbs, double sourceYAbs,
-                double gelXAbs, double gelYAbs, double yInCrop) {
-            this.label = label;
-            this.sourceXAbs = sourceXAbs;
-            this.sourceYAbs = sourceYAbs;
-            this.gelXAbs = gelXAbs;
-            this.gelYAbs = gelYAbs;
-            this.yInCrop = yInCrop;
-        }
-    }
-
-    private static final class ReconstructionImageRequest {
-        final String originalPath;
-        final int expectedWidth;
-        final int expectedHeight;
-        final List<String> roles = new ArrayList<String>();
-        boolean required;
-        boolean dimensionMismatch;
-        boolean aspectRatioMismatch;
-        boolean conflictingLoggedDimensions;
-        LoadedImage loadedImage;
-
-        ReconstructionImageRequest(String originalPath, int expectedWidth, int expectedHeight) {
-            this.originalPath = originalPath;
-            this.expectedWidth = expectedWidth;
-            this.expectedHeight = expectedHeight;
-        }
-
-        void addRole(String role) {
-            if (!roles.contains(role)) {
-                roles.add(role);
-            }
-        }
-    }
-
-    private static final class ReconstructedGeometry {
-        final double x;
-        final double y;
-        final int width;
-        final int height;
-        final double angleDeg;
-
-        ReconstructedGeometry(double x, double y, int width, int height, double angleDeg) {
-            this.x = x;
-            this.y = y;
-            this.width = width;
-            this.height = height;
-            this.angleDeg = angleDeg;
-        }
-    }
-
-    private static final class AnnotatedMarkerImage {
-        final ImagePlus imagePlus;
-        final KdaMarkerSet markerSet;
-        final double scaleX;
-        final double scaleY;
-
-        AnnotatedMarkerImage(ImagePlus imagePlus, KdaMarkerSet markerSet,
-                double scaleX, double scaleY) {
-            this.imagePlus = imagePlus;
-            this.markerSet = markerSet;
-            this.scaleX = scaleX;
-            this.scaleY = scaleY;
-        }
-    }
-
-    private enum MarkerSourceType {
-        GEL_IMAGE("Gel image", "Gel"),
-        MARKER_IMAGE("kDa marker image", "Marker");
-
-        final String displayName;
-        final String shortName;
-
-        MarkerSourceType(String displayName, String shortName) {
-            this.displayName = displayName;
-            this.shortName = shortName;
-        }
-    }
-
-    private static final class LoadedImage {
-        final ImagePlus imagePlus;
-        final String path;
-
-        LoadedImage(ImagePlus imagePlus, String path) {
-            this.imagePlus = imagePlus;
-            this.path = path;
-        }
-    }
-
-    private static final class KdaMarkerSet {
-        final String id;
-        final MarkerSourceType sourceType;
-        final String sourcePath;
-        final int sourceWidth;
-        final int sourceHeight;
-        final List<KdaMarker> markers = new ArrayList<KdaMarker>();
-        boolean frozen;
-
-        KdaMarkerSet(String id, MarkerSourceType sourceType, String sourcePath,
-                int sourceWidth, int sourceHeight) {
-            this.id = id;
-            this.sourceType = sourceType;
-            this.sourcePath = sourcePath;
-            this.sourceWidth = sourceWidth;
-            this.sourceHeight = sourceHeight;
-        }
-
-        boolean matchesSource(MarkerSourceType type, String path, int width, int height) {
-            return sourceType == type && Controller.samePath(sourcePath, path)
-                    && sourceWidth == width && sourceHeight == height;
-        }
-
-        KdaMarkerSet editableCopy(String newId) {
-            KdaMarkerSet copy = new KdaMarkerSet(newId, sourceType, sourcePath,
-                    sourceWidth, sourceHeight);
-            copy.markers.addAll(markers);
-            return copy;
-        }
-    }
-
     private static final class KdaMarker {
         final double xAbs;
         final double yAbs;
@@ -2451,56 +1716,21 @@ public class WBToolJava implements Command {
     private static final class CropMarker {
         final String label;
         final double yInCrop;
-        final double sourceXAbs;
-        final double sourceYAbs;
-        final double gelXAbs;
-        final double gelYAbs;
+        final double xAbs;
+        final double yAbs;
 
-        CropMarker(String label, double yInCrop,
-                double sourceXAbs, double sourceYAbs,
-                double gelXAbs, double gelYAbs) {
+        CropMarker(String label, double yInCrop, double xAbs, double yAbs) {
             this.label = label;
             this.yInCrop = yInCrop;
-            this.sourceXAbs = sourceXAbs;
-            this.sourceYAbs = sourceYAbs;
-            this.gelXAbs = gelXAbs;
-            this.gelYAbs = gelYAbs;
-        }
-    }
-
-    private static final class MarkerMapping {
-        final int markerWidth;
-        final int markerHeight;
-        final int gelWidth;
-        final int gelHeight;
-        final double scaleX;
-        final double scaleY;
-        final boolean dimensionsDiffer;
-        final boolean aspectRatioMismatch;
-
-        MarkerMapping(int markerWidth, int markerHeight, int gelWidth, int gelHeight,
-                double scaleX, double scaleY,
-                boolean dimensionsDiffer, boolean aspectRatioMismatch) {
-            this.markerWidth = markerWidth;
-            this.markerHeight = markerHeight;
-            this.gelWidth = gelWidth;
-            this.gelHeight = gelHeight;
-            this.scaleX = scaleX;
-            this.scaleY = scaleY;
-            this.dimensionsDiffer = dimensionsDiffer;
-            this.aspectRatioMismatch = aspectRatioMismatch;
+            this.xAbs = xAbs;
+            this.yAbs = yAbs;
         }
     }
 
     private static final class BandCrop {
         final BufferedImage image;
         final List<CropMarker> markers;
-        final String label;
-        final String sourcePath;
-        final int sourceWidth;
-        final int sourceHeight;
-        final KdaMarkerSet markerSet;
-        final MarkerMapping markerMapping;
+        String label;
         int displayWidth;
         double xOffset;
         double yOffset;
@@ -2510,18 +1740,11 @@ public class WBToolJava implements Command {
         int cropHeight;
         double cropAngleDeg;
 
-        BandCrop(BufferedImage image, List<CropMarker> markers, String label, int displayWidth,
-                String sourcePath, int sourceWidth, int sourceHeight,
-                KdaMarkerSet markerSet, MarkerMapping markerMapping) {
+        BandCrop(BufferedImage image, List<CropMarker> markers, String label, int displayWidth) {
             this.image = image;
             this.markers = markers;
             this.label = label;
             this.displayWidth = displayWidth;
-            this.sourcePath = sourcePath;
-            this.sourceWidth = sourceWidth;
-            this.sourceHeight = sourceHeight;
-            this.markerSet = markerSet;
-            this.markerMapping = markerMapping;
         }
 
         double scale() {
@@ -2530,6 +1753,20 @@ public class WBToolJava implements Command {
 
         int displayHeight() {
             return Math.max(1, (int) Math.round(image.getHeight() * scale()));
+        }
+    }
+
+    private static final class FigureRecord {
+        final File directory;
+        final String title;
+        final long modifiedAt;
+        final int cropCount;
+
+        FigureRecord(File directory, String title, long modifiedAt, int cropCount) {
+            this.directory = directory;
+            this.title = title;
+            this.modifiedAt = modifiedAt;
+            this.cropCount = cropCount;
         }
     }
 
